@@ -1,0 +1,21 @@
+# Kunci token rahasia Amerta biar gak bocor ke publik
+.env
+
+# Abaikan virtual environment biar push gak bergiga-giga beratnya
+venv/
+env/
+ENV/
+
+# Abaikan cache internal Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Abaikan file konfigurasi editor lokal
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
