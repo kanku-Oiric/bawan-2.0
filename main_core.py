@@ -85,6 +85,12 @@ from mining_engine import MiningEngine, MiningResult, Pickaxe, PICKAXES
 from ore import OreFactory, OreItem
 from crystal import CrystalFactory, CrystalItem, VARIANT_GEM, VARIANT_SPLINTER
 from economy import EconomyOracle
+from economy_engine import EconomyEngine
+from economy_engine import EconomyEngine
+from currency_engine import CurrencyEngine, preview_manifest, CurrencyManifest
+from mint_cap import CentralBankEngine
+import dataclasses
+from supabase import create_client, Client
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1 — ENVIRONMENT & LOGGING
@@ -92,6 +98,13 @@ from economy import EconomyOracle
 
 load_dotenv()
 DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
+SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL atau SUPABASE_KEY tidak ditemukan di .env!")
+
+db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 logging.basicConfig(
     level    = logging.INFO,
@@ -128,6 +141,7 @@ _GLOBAL_SPAWN_REGISTRY:   Dict[int, ServerSpawnState]       = {}
 _GLOBAL_CATALOG_REGISTRY: Dict[int, ServerMaterialCatalog]  = {}
 _GLOBAL_PROFILE_REGISTRY: Dict[int, ServerGeneticProfile]   = {}
 _GLOBAL_PLAYER_REGISTRY:  Dict[int, "PlayerProfile"]        = {}
+_GLOBAL_CURRENCY_REGISTRY: Dict[int, "CurrencyManifest"] = {}
 
 # Constant for default player stamina.
 _DEFAULT_STAMINA: float = 100.0
@@ -159,6 +173,12 @@ def _get_player(user_id: int) -> PlayerProfile:
         _GLOBAL_PLAYER_REGISTRY[user_id] = PlayerProfile()
     return _GLOBAL_PLAYER_REGISTRY[user_id]
 
+def _get_server_circulation() -> float:
+    """Menghitung total uang fiat yang sedang beredar di tangan semua player."""
+    total = 0.0
+    for p_id, profile in _GLOBAL_PLAYER_REGISTRY.items():
+        total += getattr(profile, "wallet", 0.0)
+    return total
 
 def _hydrate_server(guild: discord.Guild) -> tuple[
     ServerGeneticProfile, ServerMaterialCatalog, ServerSpawnState
@@ -984,7 +1004,126 @@ async def server_dna(interaction: discord.Interaction) -> None:
 
     await interaction.followup.send(embed=em, ephemeral=True)
 
-# AMERTA INTEGRATION: Inject Perintah `/sell_crystal` Terbuka
+# ── COMMAND MARKET STATUS (TERBARU) ──────────────────────────────────────────
+@bot.tree.command(name="market_status", description="Cek kesehatan ekonomi dan kelayakan bank sentral lokal")
+async def market_status(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    guild_id = interaction.guild_id
+
+    if guild_id not in _GLOBAL_SPAWN_REGISTRY:
+        await interaction.followup.send("❌ Server ini belum di-survei. Ketik `/explore_mines` dulu, Bung!", ephemeral=True)
+        return
+
+    catalog = _GLOBAL_CATALOG_REGISTRY[guild_id]
+    current_circulation = _get_server_circulation()
+
+    # 1. Panggil Arsitektur Mesin Terbaru (Bukan audit_monetary_health lagi!)
+    report = EconomyEngine.evaluate_server_capability(catalog, current_circulation)
+
+    # 2. Kalkulasi ulang inflation rate secara mandiri untuk keperluan display visual
+    inflation_rate = current_circulation / report.max_allowed_circulation if report.max_allowed_circulation > 0 else 0.0
+
+    # 3. Derivasi status UI berdasarkan hasil audit
+    if not report.is_eligible:
+        color = discord.Color.dark_grey()
+        status_emoji = "❌ BELUM LAYAK CETAK UANG"
+        keterangan = report.reasons[0] if report.reasons else "Tidak memenuhi syarat minimum Sovereign."
+    elif inflation_rate >= 1.0:
+        color = discord.Color.red()
+        status_emoji = "🔴 HYPERINFLATION CRISIS"
+        keterangan = report.reasons[0]
+    elif inflation_rate >= 0.75:
+        color = discord.Color.orange()
+        status_emoji = "🟡 INFLATION WARNING"
+        keterangan = report.reasons[0]
+    else:
+        color = discord.Color.green()
+        status_emoji = "🟢 SECURE & HEALTHY"
+        keterangan = report.reasons[0]
+
+    em = discord.Embed(
+        title = f"🏛️ Central Bank Monitor — {interaction.guild.name}",
+        description = f"Status Moneter: **{status_emoji}**\n\n*Keterangan Bank Sentral:*\n> {keterangan}",
+        color = color
+    )
+
+    from main_core import _reserve_bar
+    inflation_bar = _reserve_bar(inflation_rate, width=12)
+
+    em.add_field(name="📈 Indeks Inflasi", value=f"{inflation_bar} `{inflation_rate * 100:.2f}%`", inline=False)
+    em.add_field(name="💰 Sirkulasi Fiat Lokal (M2)", value=f"`{current_circulation:.2f}` / `{report.max_allowed_circulation:.2f} Fiat`", inline=True)
+    em.add_field(name="📊 Kapasitas Geologi", value=f"Score: **{report.geology_score:.2f}**", inline=True)
+    
+    multiplier_pct = report.seigniorage_modifier * 100
+    em.add_field(
+        name  = "💸 NPC Purchase Rate Modifier",
+        value = f"Harga Beli Pedagang: **{multiplier_pct:.0f}%** dari nilai dasar Oracle.",
+        inline = False
+    )
+    
+    em.set_footer(text="Data agregat kuantitatif terpusat | Backed by UA standard")
+    await interaction.followup.send(embed=em, ephemeral=True)
+
+
+# ── COMMAND SELL ORE (TERBARU) ───────────────────────────────────────────────
+@bot.tree.command(name="sell_ore", description="Jual ore hasil tambang lu ke pasar NPC lokal")
+@app_commands.describe(element_symbol="Simbol elemen atau nama ore (misal: Fe, Cu, Au, UA, Mineral Vein)")
+async def sell_ore(interaction: discord.Interaction, element_symbol: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    guild_id = interaction.guild_id
+    user_id = interaction.user.id
+
+    if guild_id not in _GLOBAL_SPAWN_REGISTRY:
+        await interaction.followup.send("❌ Server ini belum di-survei. Ketik `/explore_mines` dulu, Bung!", ephemeral=True)
+        return
+
+    catalog = _GLOBAL_CATALOG_REGISTRY[guild_id]
+    player = _get_player(user_id)
+
+    target_item = None
+    search_query = element_symbol.strip().lower()
+    
+    for item in player.ore_bag:
+        if (item.element_symbol.lower() == search_query or 
+            item.display_name.lower() == search_query or 
+            item.ore_name.lower() == search_query):
+            target_item = item
+            break
+
+    if not target_item:
+        await interaction.followup.send(f"❌ Di tas lu gak ada Ore dengan simbol atau nama `[{element_symbol}]`, Amerta!", ephemeral=True)
+        return
+
+    quote = EconomyOracle.calculate_ore_price(target_item, catalog)
+
+    # Integrasi Layer 2
+    current_circulation = _get_server_circulation()
+    audit = EconomyEngine.evaluate_server_capability(catalog, current_circulation)
+    
+    # Blokir transaksi jika server belum merdeka
+    if not audit.is_eligible:
+        alasan = "\n".join(audit.reasons)
+        await interaction.followup.send(f"❌ **TRANSAKSI DITOLAK BANK SENTRAL**\nServer belum berdaulat.\n```text\n{alasan}\n```", ephemeral=True)
+        return
+
+    fiat_payout = round(quote.total_value * audit.seigniorage_modifier, 4)
+
+    player.ore_bag.remove(target_item)
+    player.wallet += fiat_payout
+
+    em = discord.Embed(title="💰 NPC MARKET TRANSACTION SUCCESS", color=discord.Color.green())
+    em.add_field(name="📦 Komoditas", value=f"`{target_item.display_name}`", inline=True)
+    em.add_field(name="⚖️ Berat Bersih", value=f"`{target_item.weight_tonnes:.4f} Tonnes`", inline=True)
+    em.add_field(name="💎 Kemurnian", value=f"`{target_item.purity}`", inline=True)
+    em.add_field(name="📈 Scarcity Mult", value=f"`{quote.scarcity_multiplier}x`", inline=True)
+    em.add_field(name="🏛️ Bank Modifier", value=f"`{audit.seigniorage_modifier}x`", inline=True)
+    em.add_field(name="💸 Hasil Wallet", value=f"**+ {fiat_payout:.2f} Fiat**\nSaldo: **{player.wallet:.2f} Fiat**", inline=False)
+    em.set_footer(text=f"Tx ID: {target_item.item_uuid[:12]}... | Backed by UA standard")
+
+    await interaction.followup.send(embed=em, ephemeral=True)
+
+
+# ── COMMAND SELL CRYSTAL (TERBARU) ───────────────────────────────────────────
 @bot.tree.command(name="sell_crystal", description="Jual kristal hasil tambang lu ke pasar NPC lokal")
 @app_commands.describe(crystal_name="Nama lengkap kristal yang mau dijual (misal: Abyssal Calcite, Pyro Quartz)")
 async def sell_crystal(interaction: discord.Interaction, crystal_name: str) -> None:
@@ -999,10 +1138,8 @@ async def sell_crystal(interaction: discord.Interaction, crystal_name: str) -> N
     catalog = _GLOBAL_CATALOG_REGISTRY[guild_id]
     player = _get_player(user_id)
 
-    # 1. Cari kristal yang namanya cocok di dalam crystal_bag milik player
     target_item = None
     for item in player.crystal_bag:
-        # Kita normalisasi string-nya biar gak sensitif spasi dan huruf kapital
         if item.display_name.strip().lower() == crystal_name.strip().lower():
             target_item = item
             break
@@ -1011,39 +1148,159 @@ async def sell_crystal(interaction: discord.Interaction, crystal_name: str) -> N
         await interaction.followup.send(f"❌ Di tas kristal lu gak ada kristal bernama `[{crystal_name}]`, Amerta!", ephemeral=True)
         return
 
-    # 2. HITUNG VALUE LEWAT ORACLE EKONOMI LOKAL
-    # Karena kristal membawa base_market_value murni dari konvergensi depth & quality, 
-    # kita gunakan perhitungan berbasis multiplier afinitas dasar di ekonomi
     purity_map = {"Flawed": 1.0, "Prismatic": 1.6, "Ethereal": 2.5}
     purity_mod = purity_map.get(target_item.quality, 1.0)
     
-    # Nilai dasar kristal dipengaruhi oleh strategic_resource_score atau luxury_resource_score server
     if target_item.crystal_affinity in ["POWER", "MANA", "MUTATION"]:
         base_multiplier = max(30.0, catalog.strategic_resource_score * 0.25)
     else:
         base_multiplier = max(20.0, catalog.luxury_resource_score * 0.15)
         
     scarcity_mult = max(0.5, 2.0 - catalog.dominance_ratio)
-    
-    # Kalkulasi nilai jual final
     price_per_unit = base_multiplier * scarcity_mult * purity_mod
-    total_value = round(price_per_unit * (target_item.weight_tonnes * 0.1), 4) # Skala penyesuaian volume kristal
+    raw_value = round(price_per_unit * (target_item.weight_tonnes * 0.1), 4)
 
-    # 3. MUTASI STATE PLAYER
+    # Integrasi Layer 2
+    current_circulation = _get_server_circulation()
+    audit = EconomyEngine.evaluate_server_capability(catalog, current_circulation)
+    
+    # Blokir transaksi jika server belum merdeka
+    if not audit.is_eligible:
+        alasan = "\n".join(audit.reasons)
+        await interaction.followup.send(f"❌ **TRANSAKSI DITOLAK BANK SENTRAL**\nServer belum berdaulat.\n```text\n{alasan}\n```", ephemeral=True)
+        return
+
+    fiat_payout = round(raw_value * audit.seigniorage_modifier, 4)
+
     player.crystal_bag.remove(target_item)
-    player.wallet += total_value
+    player.wallet += fiat_payout
 
-    # 4. RENDER EMBED TRANSAKSI MAKRO
     em = discord.Embed(title="🔮 NPC CRYSTAL MARKET TRANSACTION SUCCESS", color=discord.Color.blue())
     em.add_field(name="📦 Komoditas", value=f"`{target_item.display_name}`", inline=True)
-    em.add_field(name="📊 Tipe Kristal", value=f"`{target_item.crystal_type}`", inline=True)
     em.add_field(name="🛡️ Afinitas Magis", value=f"`{target_item.crystal_affinity}`", inline=True)
     em.add_field(name="🔷 Kualitas", value=f"`{target_item.quality}`", inline=True)
     em.add_field(name="📈 Scarcity Mult", value=f"`{round(scarcity_mult, 4)}x`", inline=True)
-    em.add_field(name="💸 Hasil Wallet", value=f"**+ {total_value:.2f} Fiat**\nSaldo Saldo saat ini: **{player.wallet:.2f} Fiat**", inline=False)
+    em.add_field(name="🏛️ Bank Modifier", value=f"`{audit.seigniorage_modifier}x`", inline=True)
+    em.add_field(name="💸 Hasil Wallet", value=f"**+ {fiat_payout:.2f} Fiat**\nSaldo: **{player.wallet:.2f} Fiat**", inline=False)
     em.set_footer(text=f"Tx ID: {target_item.item_uuid[:12]}... | Standard Jangkar UA")
 
     await interaction.followup.send(embed=em, ephemeral=True)
+
+@bot.tree.command(name="found_currency", description="[ADMIN ONLY] Terbitkan mata uang fiat resmi server ini!")
+@app_commands.describe(
+    currency_name="Nama mata uang (misal: Amerta Dollar)",
+    ticker="Kode ticker 2-5 huruf (misal: AMD)"
+)
+async def found_currency(interaction: discord.Interaction, currency_name: str, ticker: str) -> None:
+    await interaction.response.defer(ephemeral=False) # Biar se-server bisa lihat pengumumannya!
+    guild_id = interaction.guild_id
+
+    # 1. Pastikan server sudah disurvei
+    if guild_id not in _GLOBAL_SPAWN_REGISTRY:
+        await interaction.followup.send("❌ Server belum di-survei. Jalankan `/explore_mines` dulu.")
+        return
+
+    # 2. Pastikan server belum punya mata uang
+    if guild_id in _GLOBAL_CURRENCY_REGISTRY:
+        existing = _GLOBAL_CURRENCY_REGISTRY[guild_id]
+        await interaction.followup.send(f"❌ Server ini sudah meresmikan mata uang: **{existing.currency_name} ({existing.ticker})**!")
+        return
+
+    catalog = _GLOBAL_CATALOG_REGISTRY[guild_id]
+    current_circulation = _get_server_circulation()
+
+    # 3. Audit Bank Sentral (Layer 2)
+    audit = EconomyEngine.evaluate_server_capability(catalog, current_circulation)
+
+    # 4. Coba Eksekusi Genesis (Layer 3)
+    try:
+        # Note: existing_tickers kita pass None dulu karena belum nyambung Supabase
+        manifest = CurrencyEngine.establish_sovereign_currency(
+            catalog=catalog,
+            audit=audit,
+            currency_name=currency_name,
+            ticker=ticker,
+            existing_tickers=None 
+        )
+        
+        # Simpan ke memori (Nanti diganti jadi Insert ke Supabase)
+        _GLOBAL_CURRENCY_REGISTRY[guild_id] = manifest
+
+        # Render Output Estetik pake fungsi helper dari Claude
+        report_text = preview_manifest(manifest)
+        
+        em = discord.Embed(
+            title="🎉 SOVEREIGN FIAT GENESIS SUCCESS! 🎉",
+            description=f"Server **{interaction.guild.name}** resmi mendeklarasikan kemerdekaan ekonomi!",
+            color=discord.Color.gold()
+        )
+        em.add_field(name="📜 Currency Manifest", value=f"```text\n{report_text}\n```", inline=False)
+        em.set_footer(text="Dicetak dan dijamin oleh Central Bank of Bawan | Layer 3 Consensus")
+
+        await interaction.followup.send(embed=em)
+
+    except ValueError as e:
+        # Nangkep error dari validasi regex ticker/nama atau audit gagal
+        await interaction.followup.send(f"❌ **GENESIS FAILED**\n{str(e)}", ephemeral=True)
+
+@bot.tree.command(name="mint_fiat", description="[ADMIN ONLY] Cetak uang fiat lokal tambahan (Quantitative Easing)")
+@app_commands.describe(amount="Jumlah uang yang mau dicetak (misal: 50000)")
+async def mint_fiat(interaction: discord.Interaction, amount: float) -> None:
+    await interaction.response.defer(ephemeral=False) # Biar se-server liat inflasi nambah wkwk
+    guild_id = interaction.guild_id
+
+    if guild_id not in _GLOBAL_SPAWN_REGISTRY:
+        await interaction.followup.send("❌ Server belum di-survei. Ketik `/explore_mines` dulu.")
+        return
+
+    if guild_id not in _GLOBAL_CURRENCY_REGISTRY:
+        await interaction.followup.send("❌ Server ini belum meresmikan mata uang. Pakai `/found_currency` dulu!")
+        return
+
+    catalog = _GLOBAL_CATALOG_REGISTRY[guild_id]
+    manifest = _GLOBAL_CURRENCY_REGISTRY[guild_id]
+    
+    # 1. Lempar request ke Layer 4 (Operasional Bank Sentral)
+    report = CentralBankEngine.evaluate_minting_request(
+        manifest=manifest,
+        current_geology_score=catalog.total_resource_score,
+        mint_amount=amount
+    )
+
+    # 2. Jika Bank Sentral MENOLAK (Hard cap jebol / geologi hancur)
+    if not report.success:
+        em_fail = discord.Embed(
+            title="⛔ PENCETAKAN UANG DITOLAK", 
+            description=f"**Alasan:** {report.reason}", 
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=em_fail)
+        return
+
+    # 3. Jika Bank Sentral MENYETUJUI, update state manifest yang Frozen
+    new_manifest = dataclasses.replace(
+        manifest,
+        total_supply=report.new_total_supply,
+        circulating_supply=manifest.circulating_supply + report.amount_to_circulate,
+        reserve_supply=manifest.reserve_supply + report.amount_to_reserve
+    )
+    
+    # Simpan state baru menimpa yang lama di memori
+    _GLOBAL_CURRENCY_REGISTRY[guild_id] = new_manifest
+
+    # 4. Render Output Estetik
+    em = discord.Embed(
+        title="🖨️ QUANTITATIVE EASING SUCCESS",
+        description=f"Bank Sentral **{interaction.guild.name}** resmi mencetak uang baru!",
+        color=discord.Color.green()
+    )
+    em.add_field(name="💵 Jumlah Dicetak", value=f"`+ {amount:,.2f} {manifest.ticker}`", inline=False)
+    em.add_field(name="🔄 Masuk Sirkulasi (Pasar)", value=f"`+ {report.amount_to_circulate:,.2f}`", inline=True)
+    em.add_field(name="🏦 Masuk Brankas (Reserve)", value=f"`+ {report.amount_to_reserve:,.2f}`", inline=True)
+    em.add_field(name="📈 Total Supply Terkini", value=f"`{new_manifest.total_supply:,.2f} / {manifest.policy.hard_cap_supply:,.2f}`", inline=False)
+    em.set_footer(text=report.reason)
+
+    await interaction.followup.send(embed=em)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 9 — ENTRYPOINT
