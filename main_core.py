@@ -14,7 +14,8 @@
 ║  crystal            →  CrystalFactory, CrystalItem                         ║
 ║  voice_engine       →  VoiceSessionTracker, VoiceConfig, quote_reward      ║
 ║  db_ekonomi_pusat   →  EconomyDatabase (Supabase persistence)              ║
-║  automine_engine    →  AutoMineEngine (1 swing per voice interval)         ║
+║  automine_engine    →  plan_swing (1 auto swing per voice interval)        ║
+║  mining_swing       →  execute_swing: THE swing path (manual + auto)       ║
 ║  world_registry     →  Stage 0: WorldRegistry + drand quicknet nonce       ║
 ║  world_seed         →  Stage 1: HMAC seed + pepper commit–reveal           ║
 ║  world_witness      →  External witness (public Discord webhook)           ║
@@ -123,7 +124,8 @@ from voice_engine import (
     BLOCK_ALONE,
 )
 from db_ekonomi_pusat import EconomyDatabase, normalize_supabase_url
-from automine_engine import AutoMineEngine, AutoSwing, choose_best_node, node_label
+from automine_engine import AutoSwing, plan_swing, choose_best_node, node_label
+from mining_swing import SwingOutcome, execute_swing
 from world_registry import (
     WorldRegistry,
     WorldRecord,
@@ -199,7 +201,6 @@ _spawner         = ResourceSpawner()
 _miner           = MiningEngine()
 _ore_factory     = OreFactory()
 _crystal_factory = CrystalFactory()
-_auto_miner      = AutoMineEngine(_miner, _crystal_factory)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -555,6 +556,7 @@ def _build_result_embed(
     result:  MiningResult,
     item:    Union[OreItem, CrystalItem],
     player:  PlayerProfile,
+    attempt: int,
 ) -> discord.Embed:
     """
     Build the extraction result embed shown after a successful mining attempt.
@@ -617,8 +619,10 @@ def _build_result_embed(
         inline = True,
     )
 
+    # attempt (n) + node_id are the public inputs of the roll: after the pepper
+    # reveal a player can recompute mining_roll(seed, guild, user, node, n).
     em.set_footer(text=(
-        f"Node: {result.node_id}  "
+        f"Percobaan #{attempt}  | Node: {result.node_id}  "
         f"| Depleted: {'Yes 🔴' if result.is_node_depleted else 'No 🟢'}"
         f"{'  | CRIT! ✨' if result.critical_hit else ''}"
     ))
@@ -872,66 +876,34 @@ class ToolSelectView(discord.ui.View):
             )
             return
 
-        # ── Execute mining attempt ────────────────────────────────────────────
+        # ── Execute the swing (single path shared with auto mine) ─────────────
         try:
-            result: MiningResult = _miner.execute_mining_attempt(
-                player_pickaxe = pickaxe,
-                player_stamina = player.stamina,
-                state          = state,
-                node_id        = self.node_id,
-                catalog        = catalog,
-            )
+            outcome = await _mining_swing(guild_id, user_id, player, self.node_id, pickaxe, state, catalog)
+        except SwingRejected:
+            await interaction.followup.send(_SWING_REJECTED_TEXT, ephemeral=True)
+            return
         except (KeyError, ValueError) as exc:
             log.warning("Mining attempt error: %s", exc)
             await interaction.followup.send(f"⚠️ Mining error: {exc}", ephemeral=True)
             return
-
-        # ── Deduct stamina ────────────────────────────────────────────────────
-        player.stamina = max(0.0, player.stamina - result.stamina_consumed)
-
-        # ── Pack item into inventory ──────────────────────────────────────────
-        item: Optional[Union[OreItem, CrystalItem]] = None
-        if result.success and result.amount_extracted > 0.0:
-            try:
-                if result.resource_type == "ORE":
-                    item = OreFactory.create_item_from_mining(
-                        mining_result = result,
-                        catalog       = catalog,
-                        owner_id      = user_id,
-                        server_id     = guild_id,
-                    )
-                    player.ore_bag.append(item)
-
-                elif result.resource_type in {VARIANT_GEM, VARIANT_SPLINTER}:
-                    # Get the ActiveCrystalNode for CrystalFactory
-                    crystal_node = state.active_crystals.get(self.node_id)
-                    if crystal_node is not None:
-                        item = _crystal_factory.create_item_from_mining(
-                            mining_result = result,
-                            active_node   = crystal_node,
-                            owner_id      = user_id,
-                        )
-                        player.crystal_bag.append(item)
-
-            except (ValueError, KeyError) as exc:
-                log.warning("Item factory error: %s", exc)
-                # Mining result still valid — just log and skip inventory commit
+        result, item = outcome.result, outcome.item
 
         # ── Build response ────────────────────────────────────────────────────
         if not result.success:
             await interaction.followup.send(
-                content   = f"❌ {result.flavour_message}",
+                content   = f"❌ {result.flavour_message}\n*(Percobaan #{outcome.attempt})*",
                 ephemeral = True,
             )
             return
 
         if item is not None:
-            result_embed = _build_result_embed(result, item, player)
+            result_embed = _build_result_embed(result, item, player, outcome.attempt)
             await interaction.followup.send(embed=result_embed, ephemeral=True)
         else:
             # success=True but zero yield (edge case: node depleted mid-swing)
             await interaction.followup.send(
-                content   = f"⚠️ {result.flavour_message}\n*(No item produced — zero yield.)*",
+                content   = (f"⚠️ {result.flavour_message}\n*(No item produced — zero yield. "
+                             f"Percobaan #{outcome.attempt})*"),
                 ephemeral = True,
             )
 
@@ -1599,8 +1571,8 @@ def _sync_voice_guild(guild: discord.Guild) -> None:
         _get_player(guild.id, user_id).voice_seconds += seconds
 
 
-def _pay_voice_rewards(guild: discord.Guild) -> None:
-    """Pay every completed interval in this guild's official currency + XP."""
+async def _pay_voice_rewards(guild: discord.Guild) -> None:
+    """Pay every completed interval in this guild's official currency + XP (+ auto mine)."""
     config  = _get_voice_config(guild.id)
     payouts = _voice_tracker.collect_payouts(guild.id, config)
     if not payouts:
@@ -1630,7 +1602,7 @@ def _pay_voice_rewards(guild: discord.Guild) -> None:
             f" (coin blocked: {quote.coin_blocked_reason})" if quote.coin_blocked_reason else "",
         )
         if player.automine:
-            _run_auto_mine(guild, payout.user_id, player, payout.intervals)
+            await _run_auto_mine(guild, payout.user_id, player, payout.intervals)
 
 
 # ── Auto mine ────────────────────────────────────────────────────────────────
@@ -1640,34 +1612,29 @@ def _pay_voice_rewards(guild: discord.Guild) -> None:
 _AUTOMINE_LAST: Dict[PlayerKey, AutoSwing] = {}
 
 
-def _run_auto_mine(guild: discord.Guild, user_id: int, player: PlayerProfile, swings: int) -> None:
+async def _run_auto_mine(guild: discord.Guild, user_id: int, player: PlayerProfile, swings: int) -> None:
     try:
         _, catalog, state = _hydrate_server(guild)
     except WorldPending:
         return   # world still forming; the next interval will mine
     pickaxe = PICKAXES.get(player.pickaxe_key, PICKAXES["copper_starter"])
     for _ in range(swings):
-        swing = _auto_miner.swing(
-            pickaxe     = pickaxe,
-            stamina     = player.stamina,
-            max_stamina = _DEFAULT_STAMINA,
-            state       = state,
-            catalog     = catalog,
-            owner_id    = user_id,
-            server_id   = guild.id,
-        )
-        if swing is None:
+        plan = plan_swing(state, catalog, pickaxe)
+        if plan is None:
             log.info("Auto-mine guild=%d user=%d: no minable node left", guild.id, user_id)
             return
-        player.stamina = swing.stamina_after
-        if isinstance(swing.item, OreItem):
-            player.ore_bag.append(swing.item)
-        elif isinstance(swing.item, CrystalItem):
-            player.crystal_bag.append(swing.item)
+        stamina_before = player.stamina
+        try:
+            # Same path as manual mining: counter → roll → engine → inventory.
+            outcome = await _mining_swing(guild.id, user_id, player, plan.node_id, pickaxe,
+                                          state, catalog, rest_below=plan.min_stamina)
+        except SwingRejected:
+            return   # counter unavailable → no swing at all this interval
+        swing = AutoSwing(plan.node_label, outcome, player.stamina, stamina_before < plan.min_stamina)
         _AUTOMINE_LAST[(guild.id, user_id)] = swing
         log.info(
-            "Auto-mine guild=%d user=%d → %s %.4f t from %s%s",
-            guild.id, user_id, swing.item.display_name if swing.item else "nothing",
+            "Auto-mine guild=%d user=%d #%d → %s %.4f t from %s%s",
+            guild.id, user_id, outcome.attempt, swing.item.display_name if swing.item else "nothing",
             swing.result.amount_extracted, swing.node_label,
             " (CRIT)" if swing.result.critical_hit else "",
         )
@@ -1686,7 +1653,7 @@ async def _voice_tick() -> None:
     for guild in bot.guilds:
         try:
             _sync_voice_guild(guild)
-            _pay_voice_rewards(guild)
+            await _pay_voice_rewards(guild)
         except Exception:
             log.exception("Voice tick failed for guild %s", guild.id)
     try:
@@ -2059,6 +2026,7 @@ def _build_automine_embed(
         )
         if last.result.critical_hit:
             got += "  ✨ CRIT"
+        got += f"\n`Percobaan #{last.attempt}`"
         em.add_field(name="📦  Ayunan terakhir", value=got, inline=False)
 
     em.set_footer(text=(
@@ -2188,6 +2156,64 @@ def _world_seed(record: WorldRecord) -> bytes:
     if record.status != STATUS_ACTIVE:
         raise RuntimeError(f"world of guild {record.guild_id} is still pending")
     return _seed_service.seed_for(record.algo_version, record.guild_id, record.world_nonce)
+
+
+# ── The one and only mining swing path (manual mining AND auto mine) ────────
+
+class SwingRejected(Exception):
+    """The attempt counter could not be incremented — the swing must not happen."""
+
+
+_SWING_REJECTED_TEXT: str = (
+    "⛔ Ayunan dibatalkan: pencatat nomor percobaan (database) tidak bisa dihubungi. "
+    "Tidak ada yang berubah — coba lagi sebentar lagi."
+)
+
+
+async def _mining_swing(
+    guild_id:   int,
+    user_id:    int,
+    player:     PlayerProfile,
+    node_id:    str,
+    pickaxe:    Pickaxe,
+    state:      ServerSpawnState,
+    catalog:    ServerMaterialCatalog,
+    *,
+    rest_below: Optional[float] = None,
+) -> SwingOutcome:
+    """
+    1. n = next_mining_attempt(guild, user) — atomic increment in Supabase.
+    2. roll = mining_roll(seed, guild, user, node, n) — inside execute_swing,
+       i.e. only AFTER the counter succeeded.
+    3. Apply stamina + inventory to the player.
+
+    Any DB failure raises SwingRejected and nothing changes: there is no
+    fallback roll and no in-memory counter.
+    """
+    record = _GLOBAL_WORLD_RECORDS.get(guild_id)
+    if record is None or record.status != STATUS_ACTIVE:
+        raise WorldPending(guild_id)
+    seed = _world_seed(record)
+    try:
+        attempt = await _run_db(_economy_db.next_mining_attempt, guild_id, user_id)
+    except Exception as exc:
+        log.warning("Swing rejected guild=%d user=%d: attempt counter unavailable (%s)", guild_id, user_id, exc)
+        raise SwingRejected(str(exc)) from exc
+
+    # Stamina is read only now: a concurrent swing of the same user may have spent it.
+    if rest_below is not None and player.stamina < rest_below:
+        player.stamina = _DEFAULT_STAMINA          # auto-rest, same as the free /rest
+    outcome = execute_swing(
+        _miner, _crystal_factory,
+        seed=seed, guild_id=guild_id, user_id=user_id, attempt=attempt, node_id=node_id,
+        pickaxe=pickaxe, stamina=player.stamina, state=state, catalog=catalog,
+    )
+    player.stamina = max(0.0, player.stamina - outcome.result.stamina_consumed)
+    if isinstance(outcome.item, OreItem):
+        player.ore_bag.append(outcome.item)
+    elif isinstance(outcome.item, CrystalItem):
+        player.crystal_bag.append(outcome.item)
+    return outcome
 
 
 # ── External witness ─────────────────────────────────────────────────────────

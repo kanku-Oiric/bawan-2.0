@@ -41,6 +41,7 @@ TABLE_SERVER_REGISTRY: str = "server_registry"
 TABLE_WORLD_NONCES: str = "world_nonces"
 TABLE_WORLD_COMMITMENTS: str = "world_commitments"
 TABLE_WORLD_WITNESS_LOG: str = "world_witness_log"
+TABLE_MINING_ATTEMPTS: str = "mining_attempts"
 
 # Kolom yang WAJIB ada; dicek saat startup supaya migrasi yang terlewat
 # langsung ketahuan, bukan gagal diam-diam di setiap flush.
@@ -62,6 +63,7 @@ _REQUIRED_COLUMNS = {
     TABLE_WORLD_NONCES: "guild_id,drand_round,world_nonce,drand_signature,fetched_at",
     TABLE_WORLD_COMMITMENTS: "algo_version,pepper_commitment,committed_at",
     TABLE_WORLD_WITNESS_LOG: "event_key,event_id,delivered_at",
+    TABLE_MINING_ATTEMPTS: "guild_id,user_id,attempts,updated_at",
 }
 
 # PostgREST membatasi 1000 baris per response secara default.
@@ -334,6 +336,15 @@ class EconomyDatabase:
             on_conflict="event_key", ignore_duplicates=True,
         ).execute()
 
+    # ── Mining attempt counter (monotonic; see mining_swing.py) ───────────────
+
+    def next_mining_attempt(self, guild_id: int, user_id: int) -> int:
+        """Atomically increment and return n for (guild, user).  Raises on ANY doubt."""
+        data = self._db.rpc("next_mining_attempt", {"p_guild_id": guild_id, "p_user_id": user_id}).execute().data
+        if not isinstance(data, int) or isinstance(data, bool) or data < 1:
+            raise NotSupabaseResponse(f"rpc next_mining_attempt: respons tidak valid ({type(data).__name__}). {_URL_HINT}")
+        return data
+
     # ── Diagnostics ───────────────────────────────────────────────────────────
 
     def security_report(self) -> dict:
@@ -477,6 +488,34 @@ if __name__ == "__main__":
             check("player: wallet ter-update", float(mine[0]["wallet"]), 200.0)
             check("player: snowflake di jsonb utuh", mine[0]["ore_bag"][0]["server_id"], 1234567890123456789)
             check("player: status automine tersimpan", mine[0]["automine"], True)
+
+            # Counter rows are monotonic by design (cannot be deleted) → the
+            # sentinel (guild -1, user -1) stays in the TEST project for good.
+            from concurrent.futures import ThreadPoolExecutor
+
+            def increment_on_own_connection(_):
+                # Own client per worker = own Postgres session (a shared HTTP/2
+                # client is not thread-safe); models parallel bot instances.
+                return EconomyDatabase(connect_test_database(os.environ)).next_mining_attempt(-1, -1)
+
+            with ThreadPoolExecutor(max_workers=50) as pool:
+                ns = list(pool.map(increment_on_own_connection, range(50)))
+            check("mining (b): 50 increment paralel → 50 n unik", len(set(ns)), 50)
+            check("mining (b): n berurutan tanpa celah", sorted(ns), list(range(min(ns), min(ns) + 50)))
+            restarted = EconomyDatabase(connect_test_database(os.environ))      # fresh client = "restart"
+            check("mining (c): setelah restart n lanjut, tidak mengulang", restarted.next_mining_attempt(-1, -1), max(ns) + 1)
+            for label, action in [
+                ("mining: counter dimundurkan → ditolak",
+                 lambda: raw.table(TABLE_MINING_ATTEMPTS).update({"attempts": 1})
+                            .eq("guild_id", -1).eq("user_id", -1).execute()),
+                ("mining: counter dihapus → ditolak",
+                 lambda: raw.table(TABLE_MINING_ATTEMPTS).delete().eq("guild_id", -1).eq("user_id", -1).execute()),
+            ]:
+                try:
+                    action()
+                    check(label, "diterima", "ditolak")
+                except Exception as exc:
+                    check(label, "ditolak" if "mining_attempts" in str(exc) else f"error lain: {exc}", "ditolak")
         finally:
             # Jangan sampai error cleanup menutupi error aslinya.
             try:
@@ -490,8 +529,10 @@ if __name__ == "__main__":
         # Read-only report from the PRODUCTION project + behavioural anon checks
         # against the TEST project (a failed check there cannot pollute prod).
         BOT_TABLES = {TABLE_PLAYERS, TABLE_CURRENCIES, TABLE_VOICE_CONFIG, TABLE_SERVER_REGISTRY,
-                      TABLE_WORLD_NONCES, TABLE_WORLD_COMMITMENTS, TABLE_WORLD_WITNESS_LOG}
-        BOT_FUNCTIONS = {"register_server(bigint,text,text)", "security_report()"}
+                      TABLE_WORLD_NONCES, TABLE_WORLD_COMMITMENTS, TABLE_WORLD_WITNESS_LOG,
+                      TABLE_MINING_ATTEMPTS}
+        BOT_FUNCTIONS = {"register_server(bigint,text,text)", "security_report()",
+                         "next_mining_attempt(bigint,bigint)"}
 
         prod = EconomyDatabase(create_client(normalize_supabase_url(os.getenv("SUPABASE_URL", "")),
                                              os.getenv("SUPABASE_KEY", "")))
@@ -533,6 +574,8 @@ if __name__ == "__main__":
                  lambda: anon.rpc("register_server", {"p_guild_id": -999, "p_algo_version": "v1", "p_source": "x"}).execute()),
                 ("anon SELECT world_nonces",
                  lambda: anon.table(TABLE_WORLD_NONCES).select("*").limit(1).execute()),
+                ("anon RPC next_mining_attempt",
+                 lambda: anon.rpc("next_mining_attempt", {"p_guild_id": -999, "p_user_id": -999}).execute()),
             ]:
                 try:
                     data = action().data

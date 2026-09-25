@@ -917,6 +917,14 @@ def _print_ore_item(item: OreItem, rarity_score: float, label: str) -> None:
 
 if __name__ == "__main__":
     from world_stream import test_seed
+    import itertools as _it
+    from world_stream import mining_roll as _mining_roll
+    _TEST_SEED = test_seed("ore-selftest")
+    _test_attempts = _it.count(1)
+
+    def _test_roll(state, node_id):
+        """Self-test roll: same derivation as production, fake seed & counter."""
+        return _mining_roll(_TEST_SEED, state.server_id, 42, node_id, next(_test_attempts))
     import hashlib as _hl
 
     print()
@@ -1028,6 +1036,7 @@ if __name__ == "__main__":
             state          = neon_spire_state,
             node_id        = copper_node_id,
             catalog        = neon_spire_catalog,
+            roll = _test_roll(neon_spire_state, copper_node_id),
         )
         print(f"  Mining result : success={copper_result.success}  "
               f"extracted={copper_result.amount_extracted:.4f}  "
@@ -1141,6 +1150,7 @@ if __name__ == "__main__":
             state          = uranium_state,
             node_id        = uranium_node_id,
             catalog        = uranium_catalog,
+            roll = _test_roll(uranium_state, uranium_node_id),
         )
         print(f"  Mining result : success={uranium_result.success}  "
               f"extracted={uranium_result.amount_extracted:.4f}  "

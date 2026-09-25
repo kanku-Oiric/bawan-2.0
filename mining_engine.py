@@ -22,10 +22,11 @@
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  DESIGN PRINCIPLES                                                           ║
 ║  ─────────────────────────────────────────────────────────────────────────  ║
-║  • Zero `random` Module   — all stochastic checks use a transient SHA-256   ║
-║      seed unique to (server_id, node_id, stamina) with named sub-windows    ║
-║      derived from _MiningEntropy.  Every roll is reproducible and auditable ║
-║      given the same inputs; no global RNG state is ever touched.            ║
+║  • Zero `random` Module   — every stochastic check reads a per-swing roll   ║
+║      computed by world_stream.mining_roll():                                ║
+║        HMAC(world_seed, "mining|guild_id|user_id|node_id|n")                ║
+║      where n is the player's attempt number, incremented atomically in      ║
+║      Supabase BEFORE the roll exists.  The engine never derives a roll.     ║
 ║                                                                              ║
 ║  • State Mutation Contract — MiningEngine NEVER writes directly to          ║
 ║      ServerSpawnState fields.  All reserve depletion flows through          ║
@@ -48,9 +49,9 @@
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  TRANSIENT SEED ENTROPY MAP                                                  ║
 ║  ─────────────────────────────────────────────────────────────────────────  ║
-║  seed = SHA-256(server_id[8 big] + node_id[utf-8] + stamina_repr[utf-8])   ║
+║  roll = mining_roll(seed, guild_id, user_id, node_id, n)   (256-bit int)    ║
 ║                                                                              ║
-║  Window layout (8 hex chars = 32-bit uint each):                            ║
+║  Window layout over f"{roll:064x}" (8 hex chars = 32-bit uint each):        ║
 ║    W0 [0 : 8 ] → critical_hit roll       (vs CRIT_THRESHOLD)               ║
 ║    W1 [8 :16 ] → crystal fracture roll   (vs fracture_probability)         ║
 ║    W2 [16:24 ] → yield scatter jitter    (±SCATTER_PCT of base yield)      ║
@@ -66,7 +67,7 @@ import json
 import sys
 import os
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Tuple, Union
+from typing import Callable, Dict, Optional, Tuple, Union
 
 # ── Upstream module resolution ─────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -236,11 +237,10 @@ class MiningResult:
 
 class _MiningEntropy:
     """
-    Per-attempt deterministic entropy source.
+    Per-attempt deterministic entropy source over a precomputed 256-bit roll
+    (world_stream.mining_roll).  The engine never derives rolls itself.
 
-    Seed = SHA-256(server_id[8B big-endian] + node_id[UTF-8] + stamina_key[UTF-8])
-
-    The 64-char hex digest is consumed as five 8-char (32-bit uint) windows.
+    The 64-char hex form of the roll is consumed as five 8-char (32-bit uint) windows.
     Using 32-bit windows (rather than the 24-bit windows in resource_spawner)
     gives finer probability resolution for the critical hit and fracture rolls —
     the difference between a 1-in-16M and 1-in-4B threshold matters for
@@ -256,21 +256,10 @@ class _MiningEntropy:
     _MAX_U32: int   = 0xFFFFFFFF  # 4,294,967,295
     _MAX_WINDOWS: int = 8         # 64 hex / 8 per window = 8 full windows
 
-    def __init__(
-        self,
-        server_id:      int,
-        node_id:        str,
-        player_stamina: float,
-    ) -> None:
-        # Stamina is serialised as its canonical repr string to avoid any
-        # platform-specific float byte layout issues.
-        stamina_key = repr(round(player_stamina, 6)).encode("utf-8")
-        raw_seed = (
-            server_id.to_bytes(8, "big")
-            + node_id.encode("utf-8")
-            + stamina_key
-        )
-        self._digest: str = hashlib.sha256(raw_seed).hexdigest()
+    def __init__(self, roll: int) -> None:
+        if not isinstance(roll, int) or isinstance(roll, bool) or not 0 <= roll < (1 << 256):
+            raise ValueError("roll harus int 256-bit dari world_stream.mining_roll()")
+        self._digest: str = f"{roll:064x}"
         self._cursor: int = 0
 
     def _next_uint32(self) -> int:
@@ -582,7 +571,7 @@ class MiningEngine:
     Instantiation:
         engine  = MiningEngine()
         spawner = ResourceSpawner()
-        result  = engine.execute_mining_attempt(pickaxe, stamina, state, node_id, catalog)
+        result  = engine.execute_mining_attempt(pickaxe, stamina, state, node_id, catalog, roll=roll)
 
     The spawner instance must be passed or stored if callers want to re-use
     it; MiningEngine creates its own internal ResourceSpawner for the mutation
@@ -606,6 +595,8 @@ class MiningEngine:
         state:           ServerSpawnState,
         node_id:         str,
         catalog:         ServerMaterialCatalog,
+        *,
+        roll:            int,
     ) -> MiningResult:
         """
         Execute one mining swing and return an immutable MiningResult.
@@ -632,6 +623,8 @@ class MiningEngine:
         state           : ServerSpawnState — live mutable world state.
         node_id         : str     — ID of the target ActiveOreNode or Crystal.
         catalog         : ServerMaterialCatalog — frozen geological baseline.
+        roll            : int — world_stream.mining_roll(seed, guild, user, node, n).
+                          Required: there is no fallback roll source.
 
         Returns
         -------
@@ -720,11 +713,7 @@ class MiningEngine:
         stamina_required = _stamina_cost(node.depth_layer, catalog.pressure_index)
 
         # ── Step 4: Transient entropy seed ────────────────────────────────────
-        entropy = _MiningEntropy(
-            server_id      = state.server_id,
-            node_id        = node_id,
-            player_stamina = player_stamina,
-        )
+        entropy = _MiningEntropy(roll)
 
         # ── Step 5: Base yield ────────────────────────────────────────────────
         # Base yield = node's current_reserve fraction that one swing would
@@ -879,6 +868,7 @@ class MiningEngine:
         state:          ServerSpawnState,
         node_id:        str,
         catalog:        ServerMaterialCatalog,
+        roll_for:       Callable[[int], int],
         max_swings:     int = 500,
     ) -> Tuple[int, float, int]:
         """
@@ -903,6 +893,7 @@ class MiningEngine:
                 state           = state,
                 node_id         = node_id,
                 catalog         = catalog,
+                roll            = roll_for(swings + 1),   # simulation only
             )
             swings     += 1
             total      += result.amount_extracted
@@ -1038,6 +1029,14 @@ def _print_result(result: MiningResult, node_reserve_after: float,
 
 if __name__ == "__main__":
     from world_stream import test_seed
+    import itertools as _it
+    from world_stream import mining_roll as _mining_roll
+    _TEST_SEED = test_seed("mining_engine-selftest")
+    _test_attempts = _it.count(1)
+
+    def _test_roll(state, node_id):
+        """Self-test roll: same derivation as production, fake seed & counter."""
+        return _mining_roll(_TEST_SEED, state.server_id, 42, node_id, next(_test_attempts))
 
     print()
     print(f"  {'╔' + '═' * 74 + '╗'}")
@@ -1175,6 +1174,7 @@ if __name__ == "__main__":
             state           = uranium_state,
             node_id         = abyss_node_id,
             catalog         = uranium_catalog,
+            roll = _test_roll(uranium_state, abyss_node_id),
         )
         node_after = uranium_state.active_ores[abyss_node_id]
         print(f"  ── Swing {i}  (stamina={stamina:.0f})")
@@ -1221,6 +1221,7 @@ if __name__ == "__main__":
             state          = state_a,
             node_id        = surface_node_id,
             catalog        = catalog_a,
+            roll = _test_roll(state_a, surface_node_id),
         )
         node_after = state_a.active_ores[surface_node_id]
         print(f"  ── Swing {i}")
@@ -1277,6 +1278,7 @@ if __name__ == "__main__":
             state          = state_a,
             node_id        = crystal_node_id,
             catalog        = catalog_a,
+            roll = _test_roll(state_a, crystal_node_id),
         )
         node_after = state_a.active_crystals[crystal_node_id]
         if result.resource_type == "CRYSTAL_GEM":
@@ -1310,6 +1312,7 @@ if __name__ == "__main__":
         state          = state_a,
         node_id        = guard_node_id,
         catalog        = catalog_a,
+        roll = _test_roll(state_a, guard_node_id),
     )
     print(f"    success={result_broken.success}  extracted={result_broken.amount_extracted}")
     print(f"    {result_broken.flavour_message}")
@@ -1322,6 +1325,7 @@ if __name__ == "__main__":
         state          = state_a,
         node_id        = guard_node_id,
         catalog        = catalog_a,
+        roll = _test_roll(state_a, guard_node_id),
     )
     print(f"    success={result_no_stamina.success}  extracted={result_no_stamina.amount_extracted}")
     print(f"    {result_no_stamina.flavour_message}")
@@ -1364,6 +1368,7 @@ if __name__ == "__main__":
             state          = uranium_state,
             node_id        = abyss_node_id,
             catalog        = uranium_catalog,
+            roll = _test_roll(uranium_state, abyss_node_id),
         )
         node_after = uranium_state.active_ores[abyss_node_id]
         print(f"  ── Swing {i}")
@@ -1400,6 +1405,7 @@ if __name__ == "__main__":
             state          = fresh_sub,
             node_id        = sub_nid,
             catalog        = catalog_a,
+            roll_for       = lambda n, _s=fresh_sub, _nid=sub_nid: _test_roll(_s, _nid),
             max_swings     = 2000,
         )
         delta_ok = abs(total - sub_node.max_reserve) < 0.01
@@ -1427,10 +1433,11 @@ if __name__ == "__main__":
     miner2 = MiningEngine()
 
     STAMINA_TEST = 73.5
+    DET_ROLL = _test_roll(det_state1, det_node_id)     # same roll for both engines
     r1 = miner1.execute_mining_attempt(PICKAXES["titanium_drill"], STAMINA_TEST,
-                                        det_state1, det_node_id, catalog_a)
+                                        det_state1, det_node_id, catalog_a, roll=DET_ROLL)
     r2 = miner2.execute_mining_attempt(PICKAXES["titanium_drill"], STAMINA_TEST,
-                                        det_state2, det_node_id, catalog_a)
+                                        det_state2, det_node_id, catalog_a, roll=DET_ROLL)
 
     checks = [
         ("success",          r1.success          == r2.success),

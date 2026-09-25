@@ -26,16 +26,20 @@ DOMAIN_GENETIC:  str = "genetic"    # identitas_genetik.GeneticEngine
 DOMAIN_MATERIAL: str = "material"   # material_gen.MaterialEngine
 DOMAIN_SPAWNER:  str = "spawner"    # resource_spawner.ResourceSpawner
 DOMAIN_PERIODIC: str = "periodic"   # tabel periodik per server (LANGKAH 4)
+DOMAIN_MINING:   str = "mining"     # roll per ayunan — HANYA lewat mining_roll()
 # Reserved — belum dipakai, tapi namanya sudah dikunci.
 DOMAIN_WOOD:     str = "wood"
 DOMAIN_FLORA:    str = "flora"
 DOMAIN_MOB:      str = "mob"
 DOMAIN_SEASON:   str = "season"
 
+# Domains read with an integer index i via stream() / DomainStream.
 ALL_DOMAINS = frozenset({
     DOMAIN_GENETIC, DOMAIN_MATERIAL, DOMAIN_SPAWNER, DOMAIN_PERIODIC,
     DOMAIN_WOOD, DOMAIN_FLORA, DOMAIN_MOB, DOMAIN_SEASON,
 })
+# DOMAIN_MINING is deliberately NOT in ALL_DOMAINS: its pre-image is a composite
+# key, so stream(seed, "mining", i) is rejected and mining_roll() is the only way in.
 
 SEED_BYTES: int = 32
 _UNIT_SHIFT: int = 256 - 53
@@ -57,6 +61,28 @@ def stream(seed: bytes, domain: str, i: int) -> int:
 def unit(h: int) -> float:
     """53 bit teratas dari h → float di [0, 1)."""
     return (h >> _UNIT_SHIFT) / _UNIT_SCALE
+
+
+def mining_roll(seed: bytes, guild_id: int, user_id: int, node_id: str, attempt: int) -> int:
+    """
+    Roll 256-bit untuk SATU ayunan:
+        HMAC-SHA256(seed, "mining|{guild_id}|{user_id}|{node_id}|{attempt}")
+
+    `attempt` (n) adalah nomor percobaan ke-n milik (guild, user), di-increment
+    atomik di Supabase SEBELUM roll dihitung.  Semua input kecuali seed tampil
+    ke pemain, jadi setelah pepper di-reveal setiap roll bisa dihitung ulang.
+    """
+    if not isinstance(seed, (bytes, bytearray)) or len(seed) != SEED_BYTES:
+        raise ValueError(f"seed harus {SEED_BYTES} byte")
+    for name, value in (("guild_id", guild_id), ("user_id", user_id), ("attempt", attempt)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} harus int, dapat {type(value).__name__}")
+    if attempt < 1:
+        raise ValueError("attempt harus ≥ 1")
+    if not isinstance(node_id, str) or not node_id or "|" in node_id:
+        raise ValueError("node_id harus string non-kosong tanpa '|'")
+    msg = f"{DOMAIN_MINING}|{guild_id}|{user_id}|{node_id}|{attempt}".encode("utf-8")
+    return int.from_bytes(hmac.new(bytes(seed), msg, hashlib.sha256).digest(), "big")
 
 
 def seed_fingerprint(seed: bytes) -> str:
@@ -145,6 +171,22 @@ if __name__ == "__main__":
                         ("seed pendek", (S[:16], DOMAIN_GENETIC, 0)), ("seed string", ("aa" * 32, DOMAIN_GENETIC, 0))]:
         try:
             stream(*args)
+            check(label, "diterima", "ValueError")
+        except ValueError:
+            check(label, "ValueError", "ValueError")
+
+    print("\n[4b] mining_roll")
+    NODE = "123:Fe:hematite:0"
+    check("mining_roll == HMAC langsung", mining_roll(S, 123, 456, NODE, 7),
+          int.from_bytes(hmac.new(S, f"mining|123|456|{NODE}|7".encode(), hashlib.sha256).digest(), "big"))
+    rolls = {mining_roll(S, 123, 456, NODE, n) for n in range(1, 1001)}
+    check("1000 attempt berurutan → 1000 roll unik", len(rolls), 1000)
+    check("user beda → roll beda", mining_roll(S, 123, 456, NODE, 1) != mining_roll(S, 123, 457, NODE, 1), True)
+    check("node beda → roll beda", mining_roll(S, 123, 456, NODE, 1) != mining_roll(S, 123, 456, NODE + "x", 1), True)
+    for label, args in [("stream(seed,'mining',i) ditolak", None), ("attempt 0", (S, 1, 1, NODE, 0)),
+                        ("node_id dengan '|'", (S, 1, 1, "a|b", 1)), ("attempt bool", (S, 1, 1, NODE, True))]:
+        try:
+            stream(S, DOMAIN_MINING, 0) if args is None else mining_roll(*args)
             check(label, "diterima", "ValueError")
         except ValueError:
             check(label, "ValueError", "ValueError")

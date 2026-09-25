@@ -495,8 +495,15 @@ if __name__ == "__main__":
         TEST_GID = -1
 
         print("\n[live-db] Supabase TES: idempotensi & insert-only (sentinel guild_id -1, permanen)")
+        # One client (= one connection / Postgres session) per worker: sharing a
+        # single HTTP/2 client across threads is not thread-safe, and separate
+        # sessions are the faithful model of many bot instances racing.
+        def register_on_own_connection(_):
+            own = WorldRegistry(EconomyDatabase(connect_test_database(os.environ)), [DrandQuicknet()])
+            return own.register(TEST_GID)
+
         with ThreadPoolExecutor(max_workers=50) as pool:
-            recs = list(pool.map(lambda _: live_reg.register(TEST_GID), range(50)))
+            recs = list(pool.map(register_on_own_connection, range(50)))
         check("50× register paralel → registered_at identik", len({r.registered_at for r in recs}), 1)
         check("tepat 1 baris di server_registry",
               len(client.table("server_registry").select("guild_id").eq("guild_id", TEST_GID).execute().data), 1)

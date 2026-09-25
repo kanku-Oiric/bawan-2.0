@@ -171,6 +171,57 @@ revoke all on table
     public.world_commitments, public.world_witness_log
 from anon, authenticated;
 
+-- ════════════════════════════════════════════════════════════════════════════
+-- v5: COUNTER PERCOBAAN MINING (roll = mining_roll(seed, guild, user, node, n))
+--   n di-increment atomik SEBELUM roll dihitung.  node_id ada di pre-image
+--   roll, bukan di key counter.  Counter hanya boleh naik — tidak bisa
+--   dimundurkan/dihapus untuk mengulang nomor percobaan yang hasilnya bagus.
+-- ════════════════════════════════════════════════════════════════════════════
+create table if not exists public.mining_attempts (
+    guild_id    bigint      not null,
+    user_id     bigint      not null,
+    attempts    bigint      not null check (attempts > 0),
+    updated_at  timestamptz not null default now(),
+    primary key (guild_id, user_id)
+);
+
+create or replace function public.forbid_counter_rewind() returns trigger
+language plpgsql as $$
+begin
+    if TG_OP = 'DELETE' then
+        raise exception 'mining_attempts: DELETE ditolak (counter tidak boleh direset)';
+    end if;
+    if new.guild_id <> old.guild_id or new.user_id <> old.user_id or new.attempts <= old.attempts then
+        raise exception 'mining_attempts: counter hanya boleh naik (% → %)', old.attempts, new.attempts;
+    end if;
+    return new;
+end $$;
+
+drop trigger if exists mining_attempts_monotonic on public.mining_attempts;
+create trigger mining_attempts_monotonic
+    before update or delete on public.mining_attempts
+    for each row execute function public.forbid_counter_rewind();
+drop trigger if exists mining_attempts_no_truncate on public.mining_attempts;
+create trigger mining_attempts_no_truncate
+    before truncate on public.mining_attempts
+    for each statement execute function public.forbid_mutation();
+
+-- Satu statement → atomik; row lock menyerialkan ayunan paralel user yang sama.
+create or replace function public.next_mining_attempt(p_guild_id bigint, p_user_id bigint)
+returns bigint
+language sql volatile as $$
+    insert into public.mining_attempts as m (guild_id, user_id, attempts)
+    values (p_guild_id, p_user_id, 1)
+    on conflict (guild_id, user_id)
+    do update set attempts = m.attempts + 1, updated_at = now()
+    returning m.attempts;
+$$;
+revoke all on function public.next_mining_attempt(bigint, bigint) from public, anon, authenticated;
+grant execute on function public.next_mining_attempt(bigint, bigint) to service_role;
+
+alter table public.mining_attempts enable row level security;
+revoke all on table public.mining_attempts from anon, authenticated;
+
 -- Laporan keamanan read-only (untuk `python db_ekonomi_pusat.py --security`).
 create or replace function public.security_report() returns json
 language sql stable as $$
