@@ -107,19 +107,7 @@ create trigger world_nonces_no_truncate
     before truncate on public.world_nonces
     for each statement execute function public.forbid_mutation();
 
--- Insert-or-get atomik: unique index yang menyerialkan panggilan paralel,
--- bukan cek-lalu-insert di Python.  Baris yang sudah ada dikembalikan apa adanya.
-create or replace function public.register_server(
-    p_guild_id bigint, p_algo_version text, p_source text
-) returns setof public.server_registry
-language sql volatile as $$
-    insert into public.server_registry (guild_id, algo_version, randomness_source)
-    values (p_guild_id, p_algo_version, p_source)
-    on conflict (guild_id) do nothing;
-    select * from public.server_registry where guild_id = p_guild_id;
-$$;
-revoke all on function public.register_server(bigint, text, text) from public, anon, authenticated;
-grant execute on function public.register_server(bigint, text, text) to service_role;
+-- register_server() (insert-or-get atomik) didefinisikan di v6.
 
 alter table public.server_registry enable row level security;
 alter table public.world_nonces    enable row level security;
@@ -221,6 +209,39 @@ grant execute on function public.next_mining_attempt(bigint, bigint) to service_
 
 alter table public.mining_attempts enable row level security;
 revoke all on table public.mining_attempts from anon, authenticated;
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- v6: WORLDGEN_VERSION — versi pembangkit dunia, dikunci per server
+--   Terpisah dari algo_version (cara seed dibuat).  Baris yang sudah ada
+--   otomatis ditandai 'dev' — ADD COLUMN tidak memicu trigger UPDATE, jadi
+--   aman untuk tabel insert-only.  Default langsung dicabut: registrasi baru
+--   WAJIB menyebut versinya sendiri lewat register_server().
+-- ════════════════════════════════════════════════════════════════════════════
+alter table public.server_registry add column if not exists worldgen_version text not null default 'dev';
+alter table public.server_registry alter column worldgen_version drop default;
+do $$
+begin
+    if not exists (select 1 from pg_constraint where conname = 'server_registry_worldgen_version_format') then
+        alter table public.server_registry add constraint server_registry_worldgen_version_format
+            check (worldgen_version ~ '^(dev|v[1-9][0-9]*)$');
+    end if;
+end $$;
+
+-- Insert-or-get atomik: unique index yang menyerialkan panggilan paralel,
+-- bukan cek-lalu-insert di Python.  Baris yang sudah ada dikembalikan apa
+-- adanya — worldgen_version server lama TIDAK ikut berubah.
+drop function if exists public.register_server(bigint, text, text);
+create or replace function public.register_server(
+    p_guild_id bigint, p_algo_version text, p_source text, p_worldgen_version text
+) returns setof public.server_registry
+language sql volatile as $$
+    insert into public.server_registry (guild_id, algo_version, randomness_source, worldgen_version)
+    values (p_guild_id, p_algo_version, p_source, p_worldgen_version)
+    on conflict (guild_id) do nothing;
+    select * from public.server_registry where guild_id = p_guild_id;
+$$;
+revoke all on function public.register_server(bigint, text, text, text) from public, anon, authenticated;
+grant execute on function public.register_server(bigint, text, text, text) to service_role;
 
 -- Laporan keamanan read-only (untuk `python db_ekonomi_pusat.py --security`).
 create or replace function public.security_report() returns json

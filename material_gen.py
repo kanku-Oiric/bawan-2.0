@@ -918,6 +918,13 @@ class MaterialEngine:
         ore_tuple     = tuple(ore_nodes)
         crystal_tuple = tuple(crystal_nodes)
 
+        # LANGKAH 4: every ore node must be an element of THIS server's
+        # periodic table.  No fallback — a node outside it stops generation.
+        allowed = frozenset(profile.periodic_table)
+        outside = [n.element_symbol for n in ore_tuple if n.element_symbol not in allowed]
+        if outside:
+            raise ValueError(f"node di luar tabel periodik server: {outside}")
+
         industrial_score = _score_industrial(ore_tuple, dominance_ratio)
         strategic_score  = _score_strategic(ore_tuple, crystal_tuple, pressure_index)
         luxury_score     = _score_luxury(ore_tuple, crystal_tuple)
@@ -992,6 +999,8 @@ def _build_mock_profile(
         server_id=server_id,
         created_at=0,
         genetic_signature=genetic_signature,
+        # Demo profile: its "table" is just the four hand-picked elements.
+        periodic_table=(dom_metal_sym, sec_metal_sym, dom_nm_sym, sec_nm_sym),
         dominant_metal_element=ep(dom_metal_sym, dom_metal_name, dom_metal_cat, dom_metal_rw, dom_metal_an),
         secondary_metal_element=ep(sec_metal_sym, sec_metal_name, sec_metal_cat, sec_metal_rw, sec_metal_an),
         dominant_nonmetal_element=ep(dom_nm_sym, dom_nm_name, dom_nm_cat, dom_nm_rw, dom_nm_an),
@@ -1085,6 +1094,7 @@ def _print_catalog(catalog: ServerMaterialCatalog, label: str) -> None:
 
 if __name__ == "__main__":
     from world_stream import test_seed
+    from world_periodic import build_periodic_table
 
     engine   = MaterialEngine()
     g_engine = GeneticEngine()
@@ -1173,7 +1183,9 @@ if __name__ == "__main__":
     # Uses "Neon Spire" from identitas_genetik test vectors (Fe dominant)
     # ─────────────────────────────────────────────────────────────────────
 
-    neon_spire_profile = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800)
+    neon_spire_seed    = test_seed(f"{100000000000000001}:{1577836800}")
+    neon_spire_profile = g_engine.generate_profile(server_id=100000000000000001, seed=neon_spire_seed, created_at=1577836800,
+                                                   table=build_periodic_table(neon_spire_seed))
     neon_spire_catalog = engine.generate_geology(neon_spire_profile, test_seed(f"{neon_spire_profile.server_id}:{neon_spire_profile.created_at}"))
     _print_catalog(neon_spire_catalog, "SCENARIO C — LIVE PROFILE: Neon Spire (100000000000000001)")
 

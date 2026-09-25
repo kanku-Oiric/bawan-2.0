@@ -59,7 +59,7 @@ _REQUIRED_COLUMNS = {
         "guild_id,notify_channel_id,reward_interval_minutes,reward_amount,"
         "block_self_mute_deaf,block_afk_channel,block_alone"
     ),
-    TABLE_SERVER_REGISTRY: "guild_id,algo_version,randomness_source,registered_at",
+    TABLE_SERVER_REGISTRY: "guild_id,algo_version,randomness_source,registered_at,worldgen_version",
     TABLE_WORLD_NONCES: "guild_id,drand_round,world_nonce,drand_signature,fetched_at",
     TABLE_WORLD_COMMITMENTS: "algo_version,pepper_commitment,committed_at",
     TABLE_WORLD_WITNESS_LOG: "event_key,event_id,delivered_at",
@@ -281,10 +281,12 @@ class EconomyDatabase:
 
     # ── Stage 0: server registry (insert-only; see world_registry.py) ─────────
 
-    def register_server_row(self, guild_id: int, algo_version: str, source_id: str) -> dict:
-        """Atomic insert-or-get via the register_server() SQL function."""
+    def register_server_row(self, guild_id: int, algo_version: str, source_id: str,
+                            worldgen_version: str) -> dict:
+        """Atomic insert-or-get via the register_server() SQL function (schema v6)."""
         rows = _rows(self._db.rpc("register_server", {
             "p_guild_id": guild_id, "p_algo_version": algo_version, "p_source": source_id,
+            "p_worldgen_version": worldgen_version,
         }).execute().data, "rpc register_server")
         if not rows:
             raise RuntimeError(f"register_server tidak mengembalikan baris untuk guild {guild_id}")
@@ -433,7 +435,7 @@ if __name__ == "__main__":
 
     html_gw = EconomyDatabase(_HtmlEndpoint())
     for label, fn in [("verify_schema", html_gw.verify_schema), ("load_player_rows", html_gw.load_player_rows),
-                      ("register_server_row", lambda: html_gw.register_server_row(1, "v1", "s"))]:
+                      ("register_server_row", lambda: html_gw.register_server_row(1, "v1", "s", "dev"))]:
         _HtmlEndpoint.calls = 0
         try:
             fn()
@@ -531,8 +533,9 @@ if __name__ == "__main__":
         BOT_TABLES = {TABLE_PLAYERS, TABLE_CURRENCIES, TABLE_VOICE_CONFIG, TABLE_SERVER_REGISTRY,
                       TABLE_WORLD_NONCES, TABLE_WORLD_COMMITMENTS, TABLE_WORLD_WITNESS_LOG,
                       TABLE_MINING_ATTEMPTS}
-        BOT_FUNCTIONS = {"register_server(bigint,text,text)", "security_report()",
+        BOT_FUNCTIONS = {"register_server(bigint,text,text,text)", "security_report()",
                          "next_mining_attempt(bigint,bigint)"}
+        RETIRED_FUNCTIONS = {"register_server(bigint,text,text)"}   # v6: registrasi tanpa worldgen_version
 
         prod = EconomyDatabase(create_client(normalize_supabase_url(os.getenv("SUPABASE_URL", "")),
                                              os.getenv("SUPABASE_KEY", "")))
@@ -550,8 +553,11 @@ if __name__ == "__main__":
                   (True, 0, False, False, False))
         check("semua tabel bot ada di laporan", BOT_TABLES <= {r["table"] for r in report["tables"]}, True)
         for f in (r for r in report["functions"] if r["function"] in BOT_FUNCTIONS):
-            check(f"{f['function']:<34} tidak bisa dipanggil anon/auth",
+            check(f"{f['function']:<39} tidak bisa dipanggil anon/auth",
                   (f["anon_execute"], f["auth_execute"]), (False, False))
+        present = {r["function"] for r in report["functions"]}
+        check("semua fungsi bot ada di laporan", sorted(BOT_FUNCTIONS - present), [])
+        check("fungsi lama sudah dihapus (register_server 3 argumen)", sorted(RETIRED_FUNCTIONS & present), [])
 
         anon_key = os.getenv("SUPABASE_TEST_ANON_KEY", "").strip()
         if not anon_key:
@@ -571,7 +577,8 @@ if __name__ == "__main__":
                  lambda: anon.table(TABLE_WORLD_NONCES).insert(
                      {"guild_id": -999, "drand_round": 1, "world_nonce": "0" * 64, "drand_signature": "0" * 96}).execute()),
                 ("anon RPC register_server",
-                 lambda: anon.rpc("register_server", {"p_guild_id": -999, "p_algo_version": "v1", "p_source": "x"}).execute()),
+                 lambda: anon.rpc("register_server", {"p_guild_id": -999, "p_algo_version": "v1", "p_source": "x",
+                                                      "p_worldgen_version": "dev"}).execute()),
                 ("anon SELECT world_nonces",
                  lambda: anon.table(TABLE_WORLD_NONCES).select("*").limit(1).execute()),
                 ("anon RPC next_mining_attempt",

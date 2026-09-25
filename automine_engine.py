@@ -117,6 +117,7 @@ def plan_swing(state: ServerSpawnState, catalog: ServerMaterialCatalog, pickaxe:
 
 if __name__ == "__main__":
     from world_stream import test_seed
+    from world_periodic import build_periodic_table
     from identitas_genetik import GeneticEngine
     from material_gen import MaterialEngine
     from resource_spawner import ResourceSpawner
@@ -134,7 +135,7 @@ if __name__ == "__main__":
 
     GUILD = 987654321098765432
     seed    = test_seed(f"{GUILD}:1650000000")
-    profile = GeneticEngine().generate_profile(server_id=GUILD, seed=seed, created_at=1650000000)
+    profile = GeneticEngine().generate_profile(server_id=GUILD, seed=seed, created_at=1650000000, table=build_periodic_table(seed))
     catalog = MaterialEngine().generate_geology(profile, seed)
     spawner = ResourceSpawner()
     state   = spawner.initialise(profile, catalog, seed)

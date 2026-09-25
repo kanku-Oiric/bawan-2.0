@@ -748,13 +748,14 @@ def _build_mock_catalog(
         raise NotImplementedError("Manual mock injection not implemented in this build.")
 
     from world_stream import test_seed
+    from world_periodic import build_periodic_table
 
     g_engine  = GeneticEngine()
     m_engine  = MaterialEngine()
 
     created_at = 1577836800   # Neon Spire — 2020-01-01 00:00 UTC (label only)
     seed      = test_seed(f"{server_id}:{created_at}")
-    profile   = g_engine.generate_profile(server_id=server_id, seed=seed, created_at=created_at)
+    profile   = g_engine.generate_profile(server_id=server_id, seed=seed, created_at=created_at, table=build_periodic_table(seed))
     catalog   = m_engine.generate_geology(profile, seed)
     return profile, catalog
 
@@ -765,6 +766,7 @@ def _build_mock_catalog(
 
 if __name__ == "__main__":
     from world_stream import test_seed
+    from world_periodic import build_periodic_table
 
     print()
     print(f"  {'╔' + '═' * 74 + '╗'}")
@@ -788,14 +790,14 @@ if __name__ == "__main__":
     spawner  = ResourceSpawner()
 
     # ── Server A: Neon Spire — moderate tectonic, balanced world ─────────────
-    profile_a = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800)
+    profile_a = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800, table=build_periodic_table(test_seed(f"{100000000000000001}:{1577836800}")))
     catalog_a = m_engine.generate_geology(profile_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
 
     # ── Server B: Iron Veil — high-pressure, ancient, stable world ───────────
     import hashlib as _hl
     iron_sig = _hl.sha256(b"iron_world_scenario_v1").hexdigest()
     # Build via a simplified helper that exercises live engine path
-    profile_b = g_engine.generate_profile(server_id=987654321098765432, seed=test_seed(f"{987654321098765432}:{1609459200}"), created_at=1609459200)
+    profile_b = g_engine.generate_profile(server_id=987654321098765432, seed=test_seed(f"{987654321098765432}:{1609459200}"), created_at=1609459200, table=build_periodic_table(test_seed(f"{987654321098765432}:{1609459200}")))
     catalog_b = m_engine.generate_geology(profile_b, test_seed(f"{profile_b.server_id}:{profile_b.created_at}"))
 
     print(f"  ✓ Server A — Neon Spire    (ID: {catalog_a.server_id})")

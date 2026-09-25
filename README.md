@@ -16,9 +16,24 @@ Bot Discord ekonomi MMORPG per-server. Dunia tiap server (unsur, ore, crystal, m
 | 0 — registrasi | `world_nonce` = randomness ronde **drand quicknet** pertama setelah `registered_at` | Tidak ada: rondenya di masa depan saat registrasi |
 | 1 — seed | `seed = HMAC-SHA256(pepper, "BAWAN\|{algo_version}\|{guild_id}\|{world_nonce}")` | Tidak ada: pepper terkunci oleh commitment di bawah |
 | 2 — stream | `stream(seed, domain, i) = HMAC-SHA256(seed, "{domain}\|{i}")`, `unit(h) = (h >> 203) / 2**53`; domain: `genetic`, `material`, `spawner`, `periodic` (+ cadangan `wood`, `flora`, `mob`, `season`) | Tidak ada: deterministik dari seed; tiap domain independen |
+| 3 — tabel periodik | 19 unsur core + 9 slot (structural 2, conductive 2, reactive 2, catalytic 1, rare_earth 1, exotic 1) diundi berbobot `rarity_weight` tanpa pengembalian dari `stream(seed, "periodic", i)` — lihat `world_periodic.py` | Tidak ada: deterministik dari seed |
+| 4 — unsur dominan | Dominan & sekunder (logam dan non-logam) **hanya** dari 28 unsur tabel server, bobot `round(10·√rarity_weight)`; sekunder = satu draw dari pool tanpa unsur dominan (bobot dinormalisasi ulang). Node `material_gen` wajib ⊆ tabel | Tidak ada: deterministik dari seed; tanpa fallback ke daftar global |
 | roll mining | `roll = HMAC-SHA256(seed, "mining\|{guild_id}\|{user_id}\|{node_id}\|{n}")`, `n` = counter percobaan (guild, user) yang dinaikkan atomik di DB **sebelum** roll dihitung | Pemain: tidak ada (counter tidak bisa dimundurkan/dihapus). Operator: lihat *Known limitations* |
 
 Setiap registrasi dan aktivasi dipublikasikan ke webhook saksi publik. `/worldproof` di server mana pun menampilkan semua bahan verifikasi.
+
+Status 118 unsur: 19 core, 69 dalam role, 6 excluded (He Ne Ar Kr Xe Rn — bukan bijih), 24 synthetic (Am–Lr dan 104–118; tidak di-sampling, disimpan untuk crafting). Partisi ini dicek saat bot start.
+
+### Versi worldgen
+
+`algo_version` mengunci cara **seed** dibuat. `worldgen_version` mengunci cara **dunia** dibangun dari seed (Stage 3–4, geologi, spawn awal). Keduanya dicatat per server saat registrasi di `server_registry` (insert-only) dan ikut di event saksi `registered`.
+
+| worldgen_version | Status | Arti |
+|---|---|---|
+| `dev` | aktif sekarang | Masa pengembangan: dunia **boleh berubah** saat kode berubah. Server `dev` ditandai di `server_registry.worldgen_version` dan datanya tidak dihapus. |
+| `v1` | direncanakan | Dibekukan setelah LANGKAH 5 lulus: hash commit kode worldgen dipublikasikan di sini dan di webhook saksi, dan kodenya tidak pernah dihapus. Perubahan sesudahnya = `v2`, hanya untuk server baru. |
+
+Bot menolak membangun dunia untuk `worldgen_version` yang kodenya tidak ada di build tersebut — tidak ada fallback ke versi lain.
 
 ### Pepper commitment
 

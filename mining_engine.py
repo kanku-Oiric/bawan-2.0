@@ -1029,6 +1029,7 @@ def _print_result(result: MiningResult, node_reserve_after: float,
 
 if __name__ == "__main__":
     from world_stream import test_seed
+    from world_periodic import build_periodic_table
     import itertools as _it
     from world_stream import mining_roll as _mining_roll
     _TEST_SEED = test_seed("mining_engine-selftest")
@@ -1058,7 +1059,7 @@ if __name__ == "__main__":
     miner    = MiningEngine()
 
     # ── Server A: Neon Spire (moderate tectonic, crystal-bearing) ─────────────
-    profile_a = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800)
+    profile_a = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800, table=build_periodic_table(test_seed(f"{100000000000000001}:{1577836800}")))
     catalog_a = m_engine.generate_geology(profile_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
     state_a   = spawner.initialise(profile_a, catalog_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
 
@@ -1076,6 +1077,7 @@ if __name__ == "__main__":
         server_id                  = 555000000000000555,
         created_at                 = 1420070400,
         genetic_signature          = uranium_sig,
+        periodic_table             = ("U", "Ni", "Se", "S"),   # demo: the hand-picked elements
         dominant_metal_element     = _ep("U",  "Uranium",  "actinide",        4,   92),
         secondary_metal_element    = _ep("Ni", "Nickel",   "transition metal", 300, 28),
         dominant_nonmetal_element  = _ep("Se", "Selenium", "reactive nonmetal",150, 34),

@@ -5,8 +5,10 @@
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  UPSTREAM IMPORTS (full dependency chain)                                   ║
 ║  ─────────────────────────────────────────────────────────────────────────  ║
-║  identitas_genetik  →  GeneticEngine, ServerGeneticProfile                 ║
-║  material_gen       →  MaterialEngine, ServerMaterialCatalog               ║
+║  worldgen           →  generate_world(worldgen_version, …): table →        ║
+║                         GeneticEngine → MaterialEngine → spawn state       ║
+║  identitas_genetik  →  ServerGeneticProfile                                ║
+║  material_gen       →  ServerMaterialCatalog                               ║
 ║  resource_spawner   →  ResourceSpawner, ServerSpawnState,                  ║
 ║                         ActiveOreNode, ActiveCrystalNode                   ║
 ║  mining_engine      →  MiningEngine, MiningResult, Pickaxe, PICKAXES       ║
@@ -91,8 +93,8 @@ from dotenv import load_dotenv
 # ── Upstream module resolution ────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from identitas_genetik import GeneticEngine, ServerGeneticProfile
-from material_gen import MaterialEngine, ServerMaterialCatalog
+from identitas_genetik import ServerGeneticProfile
+from material_gen import ServerMaterialCatalog
 from resource_spawner import (
     ResourceSpawner,
     ServerSpawnState,
@@ -135,6 +137,7 @@ from world_registry import (
     STATUS_ACTIVE,
 )
 from world_seed import SeedService, load_peppers, reconcile_commitments, PepperError
+from worldgen import WORLDGEN_VERSION_CURRENT, generate_world
 from world_witness import WebhookWitness, pending_events
 import dataclasses
 from supabase import create_client, Client
@@ -163,7 +166,7 @@ WORLD_LOG_WEBHOOK: str = os.getenv("WORLD_LOG_WEBHOOK", "")
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 _economy_db = EconomyDatabase(db)
 _drand = DrandQuicknet()
-_world_registry = WorldRegistry(_economy_db, [_drand])
+_world_registry = WorldRegistry(_economy_db, [_drand], worldgen_version=WORLDGEN_VERSION_CURRENT)
 _seed_service = SeedService(_PEPPERS)
 _witness = WebhookWitness(WORLD_LOG_WEBHOOK)
 
@@ -195,8 +198,6 @@ if not DISCORD_TOKEN:
 # ─────────────────────────────────────────────────────────────────────────────
 # All engines are stateless — safe to instantiate once at module level.
 
-_genetic_engine  = GeneticEngine()
-_material_engine = MaterialEngine()
 _spawner         = ResourceSpawner()
 _miner           = MiningEngine()
 _ore_factory     = OreFactory()
@@ -395,14 +396,16 @@ def _hydrate_server(guild: discord.Guild) -> tuple[
     if record is None or record.status != STATUS_ACTIVE:
         raise WorldPending(gid)
 
-    log.info("Hydrating new server: %s (id=%d, %s)", guild.name, gid, record.algo_version)
+    log.info("Hydrating new server: %s (id=%d, %s, worldgen %s)",
+             guild.name, gid, record.algo_version, record.worldgen_version)
 
     seed = _world_seed(record)
     created_at: int = int(guild.created_at.timestamp())   # informational only
 
-    profile  = _genetic_engine.generate_profile(server_id=gid, seed=seed, created_at=created_at)
-    catalog  = _material_engine.generate_geology(profile, seed)
-    state    = _spawner.initialise(profile, catalog, seed)
+    # The world is built by the code of the worldgen_version locked at
+    # registration.  Unknown version → UnsupportedWorldgen, never another version.
+    world    = generate_world(record.worldgen_version, gid, seed, created_at)
+    profile, catalog, state = world.profile, world.catalog, world.initial_state
 
     _GLOBAL_PROFILE_REGISTRY[gid]  = profile
     _GLOBAL_CATALOG_REGISTRY[gid]  = catalog
@@ -2296,6 +2299,10 @@ def _build_worldproof_embed(guild: discord.Guild, record: WorldRecord) -> discor
     )
     em.add_field(name="🆔  Guild ID", value=f"`{record.guild_id}`")
     em.add_field(name="🧬  Algo", value=f"`{record.algo_version}`")
+    em.add_field(
+        name  = "🏗️  Worldgen",
+        value = f"`{record.worldgen_version}`" + (" (dev — dunia bisa berubah)" if record.worldgen_version == "dev" else ""),
+    )
     em.add_field(name="📌  Status", value="🟢 **Aktif**" if active else "🟡 **Pending**")
     em.add_field(
         name   = "🕰️  registered_at",

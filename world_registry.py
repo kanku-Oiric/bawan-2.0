@@ -15,6 +15,8 @@
 ║    menolak UPDATE / DELETE / TRUNCATE (lihat supabase/schema.sql v3).       ║
 ║  • RandomnessSource adalah satu-satunya interface ke sumber entropi;        ║
 ║    ganti sumber = implementasi baru + algo_version baru, stage lain tetap.  ║
+║  • worldgen_version (cara dunia dibangun dari seed, lihat worldgen.py)      ║
+║    ikut dikunci di baris registrasi yang sama.                              ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  VERIFIKASI PUBLIK (siapa pun, tanpa bot)                                    ║
 ║  ─────────────────────────────────────────────────────────────────────────  ║
@@ -49,6 +51,9 @@ ALGO_VERSION_CURRENT: str = "v1"
 STATUS_PENDING: str = "pending"
 STATUS_ACTIVE:  str = "active"
 
+# Sama dengan CHECK constraint server_registry_worldgen_version_format (schema v6).
+WORLDGEN_VERSION_RE = re.compile(r"dev|v[1-9][0-9]*")    # dipakai dengan fullmatch()
+
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX96 = re.compile(r"^[0-9a-f]{96}$")
 
@@ -81,6 +86,7 @@ class WorldRecord:
     registered_at: datetime
     target_round:  int
     beacon:        Optional[Beacon]
+    worldgen_version: str               # dikunci saat registrasi (worldgen.py)
 
     @property
     def status(self) -> str:
@@ -239,12 +245,18 @@ class WorldRegistry:
 
     `db` wajib menyediakan: register_server_row, get_world_nonce_row,
     insert_world_nonce_row, load_registry_rows, load_world_nonce_rows.
+
+    `worldgen_version` = versi yang dicatat untuk server BARU; server yang
+    sudah terdaftar selalu memakai versi di barisnya sendiri.
     """
 
-    def __init__(self, db, sources: Sequence[RandomnessSource]) -> None:
+    def __init__(self, db, sources: Sequence[RandomnessSource], *, worldgen_version: str) -> None:
+        if not isinstance(worldgen_version, str) or not WORLDGEN_VERSION_RE.fullmatch(worldgen_version):
+            raise ValueError(f"worldgen_version tidak sah: {worldgen_version!r}")
         self._db = db
         self._sources = {s.source_id: s for s in sources}
         self._default = sources[0]
+        self._worldgen_version = worldgen_version
 
     def source_for(self, record: WorldRecord) -> RandomnessSource:
         try:
@@ -256,7 +268,8 @@ class WorldRegistry:
 
     def register(self, guild_id: int) -> WorldRecord:
         """Insert-or-get atomik di DB.  Baris yang sudah ada TIDAK pernah dibuat ulang."""
-        row = self._db.register_server_row(guild_id, ALGO_VERSION_CURRENT, self._default.source_id)
+        row = self._db.register_server_row(guild_id, ALGO_VERSION_CURRENT, self._default.source_id,
+                                           self._worldgen_version)
         return self._build(row, self._db.get_world_nonce_row(guild_id))
 
     def store_beacon(self, record: WorldRecord, beacon: Beacon) -> WorldRecord:
@@ -287,6 +300,7 @@ class WorldRegistry:
         return {
             "guild_id": record.guild_id, "algo_version": record.algo_version,
             "randomness_source": record.source_id, "registered_at": record.registered_at.isoformat(),
+            "worldgen_version": record.worldgen_version,
         }
 
     def _build(self, row: dict, nonce_row: Optional[dict]) -> WorldRecord:
@@ -301,7 +315,12 @@ class WorldRegistry:
             registered_at = registered_at,
             target_round  = 0,
             beacon        = None,
+            worldgen_version = row["worldgen_version"],
         )
+        if not isinstance(record.worldgen_version, str) or not WORLDGEN_VERSION_RE.fullmatch(record.worldgen_version):
+            raise RegistryIntegrityError(
+                f"guild {record.guild_id}: worldgen_version tidak sah {record.worldgen_version!r}"
+            )
         source = self.source_for(record)
         record = WorldRecord(**{**record.__dict__, "target_round": source.round_after(registered_at)})
         if nonce_row is None:
@@ -408,11 +427,12 @@ if __name__ == "__main__":
             self.nonces: Dict[int, dict] = {}
             self.clock = G + 1_000_000.0
 
-        def register_server_row(self, gid, algo, source):
+        def register_server_row(self, gid, algo, source, worldgen):
             with self.lock:                        # the DB's unique index serialises this
                 self.clock += 0.01
                 self.registry.setdefault(gid, {"guild_id": gid, "algo_version": algo, "randomness_source": source,
-                                               "registered_at": at(self.clock).isoformat()})
+                                               "registered_at": at(self.clock).isoformat(),
+                                               "worldgen_version": worldgen})
                 return dict(self.registry[gid])
 
         def get_world_nonce_row(self, gid):
@@ -430,7 +450,7 @@ if __name__ == "__main__":
             return list(self.nonces.values())
 
     db = FakeDB()
-    reg = WorldRegistry(db, [src])
+    reg = WorldRegistry(db, [src], worldgen_version="dev")
     results: List[WorldRecord] = []
     threads = [threading.Thread(target=lambda: results.append(reg.register(777))) for _ in range(50)]
     for th in threads:
@@ -440,6 +460,9 @@ if __name__ == "__main__":
     check("50× register paralel → 1 baris", len(db.registry), 1)
     check("50× register paralel → registered_at sama semua", len({r.registered_at for r in results}), 1)
     check("status awal pending", results[0].status, STATUS_PENDING)
+    check("worldgen_version tercatat saat registrasi", results[0].worldgen_version, "dev")
+    later = WorldRegistry(db, [src], worldgen_version="v2").register(777)
+    check("registrasi ulang dengan build versi lain → versi lama tetap terkunci", later.worldgen_version, "dev")
 
     rec = results[0]
     rsig = "ef" * 48
@@ -453,6 +476,20 @@ if __name__ == "__main__":
         check("beacon ronde lain ditolak", "diterima", "RegistryIntegrityError")
     except RegistryIntegrityError:
         check("beacon ronde lain ditolak", "RegistryIntegrityError", "RegistryIntegrityError")
+
+    db.registry[777]["worldgen_version"] = "v1; drop"
+    try:
+        reg.load_all()
+        check("worldgen_version tidak sah → dunia ditolak", "dipakai", "RegistryIntegrityError")
+    except RegistryIntegrityError:
+        check("worldgen_version tidak sah → dunia ditolak", "RegistryIntegrityError", "RegistryIntegrityError")
+    db.registry[777]["worldgen_version"] = "dev"
+    for bad in ("", "v1.0", "V1", "prod", "v0", "dev\n"):
+        try:
+            WorldRegistry(db, [src], worldgen_version=bad)
+            check(f"build dengan worldgen_version {bad!r} ditolak", "diterima", "ValueError")
+        except ValueError:
+            check(f"build dengan worldgen_version {bad!r} ditolak", "ValueError", "ValueError")
 
     db.nonces[777]["drand_round"] += 1          # simulate an operator tampering with the table
     try:
@@ -491,7 +528,7 @@ if __name__ == "__main__":
             print(f"\n✗ {exc}\n")
             raise SystemExit(1)
         gw = EconomyDatabase(client)
-        live_reg = WorldRegistry(gw, [DrandQuicknet()])
+        live_reg = WorldRegistry(gw, [DrandQuicknet()], worldgen_version="dev")
         TEST_GID = -1
 
         print("\n[live-db] Supabase TES: idempotensi & insert-only (sentinel guild_id -1, permanen)")
@@ -499,7 +536,8 @@ if __name__ == "__main__":
         # single HTTP/2 client across threads is not thread-safe, and separate
         # sessions are the faithful model of many bot instances racing.
         def register_on_own_connection(_):
-            own = WorldRegistry(EconomyDatabase(connect_test_database(os.environ)), [DrandQuicknet()])
+            own = WorldRegistry(EconomyDatabase(connect_test_database(os.environ)), [DrandQuicknet()],
+                                worldgen_version="dev")
             return own.register(TEST_GID)
 
         with ThreadPoolExecutor(max_workers=50) as pool:
@@ -514,10 +552,13 @@ if __name__ == "__main__":
             _time.sleep(max(0.0, wait) + 1.0)
             rec = live_reg.store_beacon(rec, live_reg.fetch_beacon(rec))
         check("nonce tersimpan & lolos cek ulang", live_reg.register(TEST_GID).world_nonce, rec.world_nonce)
+        check("worldgen_version sentinel = dev", live_reg.register(TEST_GID).worldgen_version, "dev")
 
         for label, action in [
             ("UPDATE server_registry ditolak",
              lambda: client.table("server_registry").update({"algo_version": "hack"}).eq("guild_id", TEST_GID).execute()),
+            ("UPDATE worldgen_version ditolak",
+             lambda: client.table("server_registry").update({"worldgen_version": "v9"}).eq("guild_id", TEST_GID).execute()),
             ("DELETE server_registry ditolak",
              lambda: client.table("server_registry").delete().eq("guild_id", TEST_GID).execute()),
             ("UPDATE world_nonces ditolak",

@@ -97,6 +97,7 @@ if __name__ == "__main__":
     from mining_engine import PICKAXES
     from resource_spawner import ResourceSpawner
     from world_stream import test_seed
+    from world_periodic import build_periodic_table
 
     failures = 0
 
@@ -108,7 +109,7 @@ if __name__ == "__main__":
 
     GUILD, USER = 987654321098765432, 42
     seed = test_seed("mining_swing-selftest")
-    profile = GeneticEngine().generate_profile(server_id=GUILD, seed=seed)
+    profile = GeneticEngine().generate_profile(server_id=GUILD, seed=seed, table=build_periodic_table(seed))
     catalog = MaterialEngine().generate_geology(profile, seed)
 
     def fresh_state():
@@ -127,11 +128,12 @@ if __name__ == "__main__":
     check("item dibuat untuk ayunan sukses", a.item is not None, True)
 
     print("\n[2] Stamina 100 terus (/rest tiap ayunan), node sama, n berbeda → roll berbeda")
-    st = fresh_state()
+    # A fresh (full) node per swing: depletion must not mask the crit roll.
     outs = [execute_swing(MiningEngine(), CrystalFactory(), seed=seed, guild_id=GUILD, user_id=USER,
-                          attempt=n, node_id=node, pickaxe=pick, stamina=100.0, state=st, catalog=catalog)
+                          attempt=n, node_id=node, pickaxe=pick, stamina=100.0, state=fresh_state(), catalog=catalog)
             for n in range(1, 101)]
     crits = [o.result.critical_hit for o in outs]
+    check("100 ayunan sukses (node tidak habis)", sum(o.result.success for o in outs), 100)
     check("100 roll unik", len({o.roll for o in outs}), 100)
     check("crit tidak selalu sama (bukan semua/tidak sama sekali)", 0 < sum(crits) < 100, True)
     check("laju crit wajar (2–20 dari 100; ekspektasi ~8)", 2 <= sum(crits) <= 20, True)

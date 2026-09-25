@@ -4,7 +4,8 @@ Jalankan semua pengecekan live sekaligus, lalu tampilkan ringkasan.
     python cek_live.py
 
 Urutan: --security (project utama, read-only) → --live-db & --live (project
-TES) → --commitment.  Semua langkah tetap dijalankan walau ada yang gagal.
+TES) → --commitment → tes worldgen LANGKAH 4 (offline).  Semua langkah tetap
+dijalankan walau ada yang gagal.
 """
 
 import os
@@ -18,6 +19,7 @@ STEPS = [
     ("Registry: idempotensi & insert-only", ["world_registry.py", "--live-db"]),
     ("DB tes: tulis/baca/hapus", ["db_ekonomi_pusat.py", "--live"]),
     ("Pepper commitment", ["world_seed.py", "--commitment"]),
+    ("Worldgen LANGKAH 4: isolasi & stratifikasi (offline)", ["tests/test_worldgen_langkah4.py"]),
 ]
 
 env = {**os.environ, "PYTHONIOENCODING": "utf-8"}

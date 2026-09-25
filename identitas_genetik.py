@@ -27,13 +27,12 @@ DESIGN PRINCIPLES
                             stream(seed, "genetic", i) (world_stream.py).
                             No platform-specific RNG is touched.
                             The `random` module is never imported.
-• Entropy Slicing         — The 64-character hex digest is split into 10
-                            non-overlapping 6-character windows (each yielding
-                            a 24-bit uint) plus 2 residual chars as tie-breaker
-                            salt.  Each window drives exactly one output field.
-• Cumulative Weight Search— Element selection uses a deterministic CWS instead
-                            of modulo-indexing, so rarity_weight controls the
-                            true probability of each element appearing.
+• Entropy Slicing         — Slice i = stream(seed, "genetic", i), a 256-bit
+                            integer; each slice drives exactly one output field.
+• Cumulative Weight Search— Element selection is a deterministic CWS over the
+                            server's own periodic table (world_periodic), with
+                            weight dominant_weight = round(10·√rarity_weight).
+                            No global element pool, no fallback.
 • Cascade Pipeline        — Elements are generated first (Phase 1), their
                             ElementModifiers mutate a scratch-pad of biome
                             weights and scalar nudges (Phase 2), then biomes
@@ -43,32 +42,32 @@ DESIGN PRINCIPLES
                             MUST layer runtime deltas on top; they must NEVER
                             mutate the profile object.
 
-ENTROPY SLICE MAP  (SHA-256 hex digest → fields)
+ENTROPY SLICE MAP  (slice i = stream(seed, "genetic", i))
 ─────────────────────────────────────────────────────────────────────────────
-  The 64-char hex string is partitioned into 10 × 6-char windows (60 chars)
-  with the final 4 chars reserved as auxiliary salt.
-
-  Slice  0  [ 0: 6]  →  dominant_metal_element   (Phase 1)
-  Slice  1  [ 6:12]  →  dominant_nonmetal_element (Phase 1)
-  Slice  2  [12:18]  →  secondary_metal_element   (Phase 1)
-  Slice  3  [18:24]  →  secondary_nonmetal_element(Phase 1)
-  Slice  4  [24:30]  →  world_age                 (Phase 3)
-  Slice  5  [30:36]  →  base_world_stability       (Phase 3, pre-modifier)
-  Slice  6  [36:42]  →  base_resource_density      (Phase 3, pre-modifier)
-  Slice  7  [42:48]  →  base_mutation_index        (Phase 3, pre-modifier)
-  Slice  8  [48:54]  →  biome count + primary biome(Phase 3)
-  Slice  9  [54:60]  →  secondary + tertiary biome (Phase 3)
-  Salt      [60:64]  →  reserved (tie-breaking, future use)
+  Slice  0  →  dominant_metal_element     (Phase 1, table metals)
+  Slice  1  →  dominant_nonmetal_element  (Phase 1, table non-metals)
+  Slice  2  →  secondary_metal_element    (Phase 1, dominant removed, renormalised)
+  Slice  3  →  secondary_nonmetal_element (Phase 1, dominant removed, renormalised)
+  Slice  4  →  world_age                  (Phase 3)
+  Slice  5  →  base_world_stability       (Phase 3, pre-modifier)
+  Slice  6  →  base_resource_density      (Phase 3, pre-modifier)
+  Slice  7  →  base_mutation_index        (Phase 3, pre-modifier)
+  Slice  8  →  biome count + primary biome (Phase 3, 128-bit halves)
+  Slice  9  →  secondary + tertiary biome  (Phase 3, 128-bit halves)
 ─────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field, asdict
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional, Tuple
 
 from world_stream import DOMAIN_GENETIC, stream, unit, seed_fingerprint
+
+if TYPE_CHECKING:                       # world_periodic imports this module
+    from world_periodic import ServerPeriodicTable
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +237,7 @@ _NONMETAL_ELEMENTS: List[Element] = [
     Element(51,  "Sb", "Antimony",      "metalloid",             121.760, 5, 15,  100),
     Element(52,  "Te", "Tellurium",     "metalloid",             127.60,  5, 16,   80),
     Element(84,  "Po", "Polonium",      "metalloid",             209.0,   6, 16,    3),  # Highly radioactive
+    Element(117, "Ts", "Tennessine",    "metalloid",             294.0,   7, 17,    1),  # Synthetic, predicted category; never sampled
 
     # ── Noble Gases ───────────────────────────────────────────────────────
     Element(2,   "He", "Helium",        "noble gas",             4.003,   1, 18,  400),
@@ -272,6 +272,27 @@ _ELEMENT_BY_ATOMIC: Dict[int, Element] = {
     e.atomic_number: e
     for e in _METAL_ELEMENTS + _NONMETAL_ELEMENTS
 }
+
+# Read-only catalogue of all 118 elements, ordered by atomic number.  This is
+# DATA only: selection pools come exclusively from the server's own
+# world_periodic.ServerPeriodicTable — GeneticEngine has no global pool.
+ELEMENTS: Tuple[Element, ...] = tuple(
+    sorted(_METAL_ELEMENTS + _NONMETAL_ELEMENTS, key=lambda e: e.atomic_number)
+)
+
+
+def dominant_weight(rarity_weight: int) -> int:
+    """
+    Selection weight for dominant & secondary elements (LANGKAH 4, option O2):
+    round(10 · √rarity_weight), computed in exact integer arithmetic so it is
+    identical on every platform.  (A tie is impossible: √n is an integer or
+    irrational.)  rarity_weight itself still drives table slots, yields, etc.
+    """
+    if isinstance(rarity_weight, bool) or not isinstance(rarity_weight, int) or rarity_weight < 1:
+        raise ValueError(f"rarity_weight harus int ≥ 1, dapat {rarity_weight!r}")
+    n = 100 * rarity_weight
+    r = math.isqrt(n)
+    return r + (n - r * r > r)          # √n ≥ r + ½  ⇔  n ≥ r² + r + 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -645,10 +666,13 @@ class ServerGeneticProfile:
 
     Entropy Slice Map   (slice i = stream(seed, "genetic", i), 256-bit)
     ─────────────────────────────────────────────────────────────────────
+    Phase 1 pools = metals / non-metals of the server's periodic table ONLY,
+    weighted by dominant_weight(rarity_weight).  Secondary = one draw from
+    the same pool with the dominant removed and weights renormalised.
     Slice 0  → dominant_metal_element        (Phase 1 – CWS)
     Slice 1  → dominant_nonmetal_element      (Phase 1 – CWS)
-    Slice 2  → secondary_metal_element        (Phase 1 – CWS)
-    Slice 3  → secondary_nonmetal_element     (Phase 1 – CWS)
+    Slice 2  → secondary_metal_element        (Phase 1 – CWS, dominant removed)
+    Slice 3  → secondary_nonmetal_element     (Phase 1 – CWS, dominant removed)
     Slice 4  → world_age                      (Phase 3)
     Slice 5  → base_world_stability            (Phase 3, mod-adjusted)
     Slice 6  → base_resource_density           (Phase 3, mod-adjusted)
@@ -662,6 +686,7 @@ class ServerGeneticProfile:
     server_id:          int
     created_at:         int      # Informational only — does NOT influence the world
     genetic_signature:  str      # PUBLIC fingerprint of the seed (world_stream.seed_fingerprint)
+    periodic_table:     Tuple[str, ...]   # the server's 28 symbols (core, then slots in draw order)
 
     # ── Phase 1: Dominant Elements ────────────────────────────────────────
     dominant_metal_element:    ElementProfile
@@ -693,6 +718,7 @@ class ServerGeneticProfile:
         """Return a fully JSON-serialisable plain dict."""
         d = asdict(self)
         # Convert tuples to lists for JSON compatibility
+        d["periodic_table"]     = list(d["periodic_table"])
         d["biome_affinity"]     = list(d["biome_affinity"])
         d["world_flavour_tags"] = list(d["world_flavour_tags"])
         return d
@@ -712,8 +738,9 @@ class GeneticEngine:
     Architecture: Three-Phase Cascade
     ──────────────────────────────────
     Phase 1 — Elements First
-        Pick dominant & secondary metals/non-metals using Cumulative Weight
-        Search so rarity_weight actually controls selection probability.
+        Pick dominant & secondary metals/non-metals from the server's own
+        periodic table (world_periodic) using Cumulative Weight Search over
+        dominant_weight(rarity_weight).  There is no global element pool.
 
     Phase 2 — Element Modifiers (the Cascade Effect)
         The dominant metal and non-metal symbols are looked up in
@@ -748,27 +775,7 @@ class GeneticEngine:
     _S_BIOME_A      = 8    # biome count + primary
     _S_BIOME_B      = 9    # secondary + tertiary offsets
 
-    # ── Canonical pools (frozen at class level for re-use safety) ─────────
-    _METALS:    Tuple[Element, ...] = tuple(
-        sorted(_METAL_ELEMENTS,    key=lambda e: e.atomic_number)
-    )
-    _NONMETALS: Tuple[Element, ...] = tuple(
-        sorted(_NONMETAL_ELEMENTS, key=lambda e: e.atomic_number)
-    )
     _BIOMES:    Tuple[str, ...]     = _BIOME_TAGS
-
-    # ── Pre-computed cumulative weight tables ─────────────────────────────
-    # Format: list of (cumulative_weight, element) for fast CWS
-    _METAL_CW:    Tuple[Tuple[int, Element], ...] = ()
-    _NONMETAL_CW: Tuple[Tuple[int, Element], ...] = ()
-
-    def __init_subclass__(cls, **kwargs: object) -> None:
-        super().__init_subclass__(**kwargs)
-
-    def __init__(self) -> None:
-        # Build cumulative weight tables once per instance
-        self._METAL_CW    = self._build_cumulative_table(self._METALS)
-        self._NONMETAL_CW = self._build_cumulative_table(self._NONMETALS)
 
     # ─────────────────────────────────────────────────────────────────────
     # PUBLIC API
@@ -779,6 +786,8 @@ class GeneticEngine:
         server_id:  int,
         seed:       bytes,
         created_at: int = 0,
+        *,
+        table:      "ServerPeriodicTable",
     ) -> ServerGeneticProfile:
         """
         Derive an immutable ServerGeneticProfile from the Stage-1 *seed*
@@ -790,23 +799,25 @@ class GeneticEngine:
                      it already sits inside the seed pre-image).
         seed       : 32-byte Stage-1 world seed (world_seed.derive_seed).
         created_at : Informational Unix timestamp; does NOT affect the world.
+        table      : world_periodic.build_periodic_table(seed) — REQUIRED; the
+                     only source of candidate elements (no fallback).
 
         Returns
         -------
         ServerGeneticProfile — fully deterministic, frozen, cross-platform.
         """
+        metals, nonmetals = self._pools(table, seed)
+
         # ── Stage-2 stream slices ─────────────────────────────────────────
         slices = [stream(seed, DOMAIN_GENETIC, i) for i in range(self._N_SLICES)]
 
         # ═════════════════════════════════════════════════════════════════
         # PHASE 1 — ELEMENT SELECTION (Cumulative Weight Search)
         # ═════════════════════════════════════════════════════════════════
-        dom_metal    = self._cws_element(slices[self._S_DOM_METAL],    self._METAL_CW)
-        dom_nonmetal = self._cws_element(slices[self._S_DOM_NONMETAL], self._NONMETAL_CW)
-        sec_metal    = self._cws_element(slices[self._S_SEC_METAL],    self._METAL_CW,
-                                         exclude_symbol=dom_metal.symbol)
-        sec_nonmetal = self._cws_element(slices[self._S_SEC_NONMETAL], self._NONMETAL_CW,
-                                         exclude_symbol=dom_nonmetal.symbol)
+        dom_metal    = self._pick(slices[self._S_DOM_METAL],    metals)
+        dom_nonmetal = self._pick(slices[self._S_DOM_NONMETAL], nonmetals)
+        sec_metal    = self._pick(slices[self._S_SEC_METAL],    self._without(metals, dom_metal))
+        sec_nonmetal = self._pick(slices[self._S_SEC_NONMETAL], self._without(nonmetals, dom_nonmetal))
 
         # ═════════════════════════════════════════════════════════════════
         # PHASE 2 — ELEMENT MODIFIER CASCADE (inject into scratch-pad)
@@ -878,6 +889,7 @@ class GeneticEngine:
             server_id=server_id,
             created_at=created_at,
             genetic_signature=seed_fingerprint(seed),
+            periodic_table=table.symbols,
             dominant_metal_element=_element_to_profile(dom_metal),
             secondary_metal_element=_element_to_profile(sec_metal),
             dominant_nonmetal_element=_element_to_profile(dom_nonmetal),
@@ -905,16 +917,6 @@ class GeneticEngine:
         return element.category in _NONMETAL_CATEGORIES
 
     @staticmethod
-    def metal_pool() -> Tuple[Element, ...]:
-        """Return the canonical ordered metal pool."""
-        return GeneticEngine._METALS
-
-    @staticmethod
-    def nonmetal_pool() -> Tuple[Element, ...]:
-        """Return the canonical ordered non-metal pool."""
-        return GeneticEngine._NONMETALS
-
-    @staticmethod
     def biome_pool() -> Tuple[str, ...]:
         """Return the canonical biome tag pool."""
         return GeneticEngine._BIOMES
@@ -934,83 +936,53 @@ class GeneticEngine:
         return unit(h)
 
     # ─────────────────────────────────────────────────────────────────────
-    # PRIVATE — Cumulative Weight Search (CWS) engine
+    # PRIVATE — Element pools & Cumulative Weight Search (CWS)
     # ─────────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _build_cumulative_table(
-        pool: Tuple[Element, ...],
-    ) -> Tuple[Tuple[int, Element], ...]:
-        """
-        Pre-compute a cumulative weight table for CWS.
-
-        Returns a tuple of (cumulative_weight_ceiling, element) pairs sorted
-        in ascending cumulative weight order.  The last entry's ceiling equals
-        the total weight of the entire pool.
-
-        Example (3 elements, weights 1000, 500, 10):
-            total = 1510
-            table = [(1000, Fe), (1500, Cu), (1510, Au)]
-        """
-        cumulative = 0
-        table: List[Tuple[int, Element]] = []
-        for element in pool:
-            cumulative += element.rarity_weight
-            table.append((cumulative, element))
-        return tuple(table)
-
-    def _cws_element(
+    def _pools(
         self,
-        h: int,
-        cum_table: Tuple[Tuple[int, Element], ...],
-        exclude_symbol: Optional[str] = None,
-    ) -> Element:
+        table: "ServerPeriodicTable",
+        seed:  bytes,
+    ) -> Tuple[Tuple[Element, ...], Tuple[Element, ...]]:
         """
-        Deterministic Cumulative Weight Search.
-
-        Maps the stream value *h* onto the total weight range of
-        *cum_table*, then performs a linear scan to find the element whose
-        cumulative ceiling first exceeds the mapped target.
-
-        If *exclude_symbol* is given and the CWS result matches it, the search
-        continues to the next entry in the table (wrapping if needed), ensuring
-        dominant ≠ secondary without discarding the entropy.
-
-        Parameters
-        ----------
-        h               : Stream value (256-bit; modulo bias <= total/2**256).
-        cum_table       : Pre-computed cumulative weight table.
-        exclude_symbol  : Symbol of an element to skip (for secondary picks).
-
-        Returns
-        -------
-        Element — exactly one element, deterministically selected.
+        Metal and non-metal candidates = this server's table ONLY, ordered by
+        atomic number.  A table from another seed, or one without at least
+        two metals and two non-metals, is an error — never a fallback.
         """
-        total_weight = cum_table[-1][0]
-        # Map the stream value to [0, total_weight - 1]
-        target   = h % total_weight          # bounded, deterministic
+        if table.seed_fingerprint != seed_fingerprint(seed):
+            raise ValueError("tabel periodik bukan milik seed ini")
+        by_z = sorted(table.elements, key=lambda e: e.atomic_number)
+        metals    = tuple(e for e in by_z if self.is_metal(e))
+        nonmetals = tuple(e for e in by_z if self.is_nonmetal(e))
+        if len(metals) < 2 or len(nonmetals) < 2:
+            raise ValueError(
+                f"tabel server butuh ≥2 logam dan ≥2 non-logam (ada {len(metals)} / {len(nonmetals)})"
+            )
+        return metals, nonmetals
 
-        # Linear CWS scan
-        selected: Optional[Element] = None
-        for ceiling, element in cum_table:
+    @staticmethod
+    def _without(pool: Tuple[Element, ...], element: Element) -> Tuple[Element, ...]:
+        """Pool with *element* removed — the secondary draw renormalises over this."""
+        return tuple(e for e in pool if e.symbol != element.symbol)
+
+    @staticmethod
+    def _pick(h: int, candidates: Tuple[Element, ...]) -> Element:
+        """
+        One weighted draw, no retries:
+            P(e) = dominant_weight(e) / Σ dominant_weight(candidates)
+        target = h mod total (bias ≤ total / 2**256), then a linear scan of
+        cumulative weights in atomic-number order.
+        """
+        if not candidates:
+            raise ValueError("kandidat unsur kosong")
+        weights = [dominant_weight(e.rarity_weight) for e in candidates]
+        target = h % sum(weights)
+        ceiling = 0
+        for element, w in zip(candidates, weights):
+            ceiling += w
             if target < ceiling:
-                selected = element
-                break
-
-        # Fallback safety (should never trigger with a correct table)
-        if selected is None:
-            selected = cum_table[-1][1]
-
-        # Exclusion: step to next entry if we hit the excluded symbol
-        if exclude_symbol is not None and selected.symbol == exclude_symbol:
-            # Find this element's position and take the next one (wrapping)
-            for i, (_, element) in enumerate(cum_table):
-                if element.symbol == selected.symbol:
-                    next_idx = (i + 1) % len(cum_table)
-                    selected = cum_table[next_idx][1]
-                    break
-
-        return selected
+                return element
+        raise AssertionError("unreachable: target < total weight")
 
     # ─────────────────────────────────────────────────────────────────────
     # PRIVATE — World Age
@@ -1226,6 +1198,7 @@ def _print_profile(profile: ServerGeneticProfile, label: str) -> None:
 
 if __name__ == "__main__":
     from world_stream import test_seed
+    from world_periodic import build_periodic_table
     engine = GeneticEngine()
 
     # ── Test vectors — outputs MUST be identical on every machine ─────────
@@ -1243,10 +1216,8 @@ if __name__ == "__main__":
     print(f"  ║{'IDENTITAS GENETIK.PY  v2.0  —  Cascade Determinism Proof':^70}║")
     print(f"  {'╚' + '═' * 70 + '╝'}")
     print()
-    print(f"  Metal pool         : {len(GeneticEngine.metal_pool()):>3} elements"
-          f"   (total weight = {sum(e.rarity_weight for e in GeneticEngine.metal_pool()):,})")
-    print(f"  Non-metal pool     : {len(GeneticEngine.nonmetal_pool()):>3} elements"
-          f"   (total weight = {sum(e.rarity_weight for e in GeneticEngine.nonmetal_pool()):,})")
+    print(f"  Element catalogue  : {len(ELEMENTS):>3} elements"
+          f"   (pools per server = world_periodic table, 28 elements)")
     print(f"  Biome pool         : {len(GeneticEngine.biome_pool()):>3} biomes")
     print(f"  Modifiers defined  : {len(_ELEMENT_MODIFIERS):>3} elements")
     print()
@@ -1254,7 +1225,8 @@ if __name__ == "__main__":
     profiles: List[ServerGeneticProfile] = []
     for entry in TEST_SERVERS:
         label, sid, cat = entry
-        profile = engine.generate_profile(server_id=sid, seed=test_seed(f"{sid}:{cat}"), created_at=cat)
+        seed = test_seed(f"{sid}:{cat}")
+        profile = engine.generate_profile(server_id=sid, seed=seed, created_at=cat, table=build_periodic_table(seed))
         profiles.append(profile)
         _print_profile(profile, label)
         print()
@@ -1268,8 +1240,9 @@ if __name__ == "__main__":
     all_pass = True
     for entry in TEST_SERVERS:
         label, sid, cat = entry
-        p1 = engine.generate_profile(sid, test_seed(f"{sid}:{cat}"), cat)
-        p2 = engine.generate_profile(sid, test_seed(f"{sid}:{cat}"), cat)
+        seed = test_seed(f"{sid}:{cat}")
+        p1 = engine.generate_profile(sid, seed, cat, table=build_periodic_table(seed))
+        p2 = engine.generate_profile(sid, seed, cat, table=build_periodic_table(seed))
         checks = [
             p1.genetic_signature        == p2.genetic_signature,
             p1.dominant_metal_element   == p2.dominant_metal_element,
@@ -1313,3 +1286,5 @@ if __name__ == "__main__":
     print("    ...")
     print()
     print(_DIV_MAJOR)
+
+    raise SystemExit(0 if all_pass and rt_ok else 1)

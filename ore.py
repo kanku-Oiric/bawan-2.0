@@ -917,6 +917,7 @@ def _print_ore_item(item: OreItem, rarity_score: float, label: str) -> None:
 
 if __name__ == "__main__":
     from world_stream import test_seed
+    from world_periodic import build_periodic_table
     import itertools as _it
     from world_stream import mining_roll as _mining_roll
     _TEST_SEED = test_seed("ore-selftest")
@@ -950,7 +951,7 @@ if __name__ == "__main__":
     miner     = MiningEngine()
 
     # ── Neon Spire: a real pipeline run (the Copper world) ───────────────────
-    neon_spire_profile = g_engine.generate_profile(server_id=100_000_000_000_000_001, seed=test_seed(f"{100_000_000_000_000_001}:{1_577_836_800}"), created_at=1_577_836_800)
+    neon_spire_profile = g_engine.generate_profile(server_id=100_000_000_000_000_001, seed=test_seed(f"{100_000_000_000_000_001}:{1_577_836_800}"), created_at=1_577_836_800, table=build_periodic_table(test_seed(f"{100_000_000_000_000_001}:{1_577_836_800}")))
     neon_spire_catalog = m_engine.generate_geology(neon_spire_profile, test_seed(f"{neon_spire_profile.server_id}:{neon_spire_profile.created_at}"))
     neon_spire_state   = spawner.initialise(neon_spire_profile, neon_spire_catalog, test_seed(f"{neon_spire_profile.server_id}:{neon_spire_profile.created_at}"))
 
@@ -973,6 +974,7 @@ if __name__ == "__main__":
         server_id                  = 111_000_111_000_111_001,
         created_at                 = 0,
         genetic_signature          = uranium_sig,
+        periodic_table             = ("U", "Th", "S", "F"),   # demo: the hand-picked elements
         dominant_metal_element     = _ep("U",  "Uranium",  "actinide",        4,   92),
         secondary_metal_element    = _ep("Th", "Thorium",  "actinide",        5,   90),
         dominant_nonmetal_element  = _ep("S",  "Sulfur",   "reactive nonmetal", 600, 16),

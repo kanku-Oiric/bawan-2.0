@@ -659,6 +659,7 @@ def _print_crystal_item(item: CrystalItem, label: str = "") -> None:
 
 if __name__ == "__main__":
     from world_stream import test_seed
+    from world_periodic import build_periodic_table
 
     print()
     print(f"  ╔{'═' * 70}╗")
@@ -680,7 +681,7 @@ if __name__ == "__main__":
     factory   = CrystalFactory()
     miner     = MiningEngine()
 
-    profile  = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800)
+    profile  = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800, table=build_periodic_table(test_seed(f"{100000000000000001}:{1577836800}")))
     catalog  = m_engine.generate_geology(profile, test_seed(f"{profile.server_id}:{profile.created_at}"))
     state    = spawner.initialise(profile, catalog, test_seed(f"{profile.server_id}:{profile.created_at}"))
 

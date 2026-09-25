@@ -62,6 +62,7 @@ def events_for_record(record: WorldRecord, source: RandomnessSource) -> List[Wit
     base = {
         "guild_id":          record.guild_id,
         "algo_version":      record.algo_version,
+        "worldgen_version":  record.worldgen_version,
         "registered_at":     record.registered_at.isoformat(),
         "randomness_source": record.source_id,
         "drand_round":       record.target_round,
@@ -160,13 +161,16 @@ if __name__ == "__main__":
 
     src = DrandQuicknet()
     t = datetime(2026, 9, 25, 12, 0, 0, 123456, tzinfo=timezone.utc)
-    pending_rec = WorldRecord(111, "v1", src.source_id, t, src.round_after(t), None)
+    pending_rec = WorldRecord(111, "v1", src.source_id, t, src.round_after(t), None, "dev")
     sig = "ab" * 48
     active_rec = WorldRecord(222, "v1", src.source_id, t, src.round_after(t),
-                             Beacon(src.source_id, src.round_after(t), hashlib.sha256(bytes.fromhex(sig)).hexdigest(), sig))
+                             Beacon(src.source_id, src.round_after(t), hashlib.sha256(bytes.fromhex(sig)).hexdigest(), sig),
+                             "dev")
     commits = [{"algo_version": "v1", "pepper_commitment": "c" * 64, "committed_at": "2026-09-25T00:00:00+00:00"}]
 
     print("\n[1] Event diturunkan dari data")
+    reg_event = [e for e in pending_events([pending_rec], lambda r: src, [], []) if e.kind == EVENT_REGISTERED][0]
+    check("event registered memuat worldgen_version", reg_event.payload.get("worldgen_version"), "dev")
     keys = [e.key for e in pending_events([pending_rec, active_rec], lambda r: src, commits, [])]
     check("urutan & kelengkapan", keys,
           ["commitment:v1", "registered:111", "registered:222", "activated:222"])
