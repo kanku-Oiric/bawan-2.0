@@ -1154,14 +1154,20 @@ if __name__ == "__main__":
         # Here we rebuild a synthetic MiningResult that matches the node's actual
         # ore_name but forces Flawless purity via catalog manipulation for the demo.
         # ── IMPORTANT: we override the catalog node for this demo only ────────
+        # vein_count / vein_size live on the catalog OreNode, not on the runtime
+        # ActiveOreNode (one vein instance), so read them from the catalog.
+        u_catalog_node = next(
+            (n for n in uranium_catalog.ore_nodes if n.element_symbol == u_node.element_symbol),
+            None,
+        )
         # Build a Flawless version of the Uranium node for the showcase
         flawless_u_node = OreNode(
             element_symbol   = "U",
             ore_name         = "Uraninite",
             purity           = "Flawless",                      # Forced for showcase
             depth_layer      = "ABYSS",
-            vein_count       = u_node.vein_count if uranium_node_id else 1,
-            vein_size        = u_node.vein_size if uranium_node_id else 0.5,
+            vein_count       = u_catalog_node.vein_count if u_catalog_node else 1,
+            vein_size        = u_catalog_node.vein_size if u_catalog_node else 0.5,
             reserve_quantity = 200.0,
             base_yield       = u_node.rarity_score * 5.0,
             rarity_score     = u_node.rarity_score,             # Preserved from catalog
