@@ -41,7 +41,10 @@ Cara mendapatkan nilainya: `python world_seed.py --commitment`. Nilai yang sama 
 
 Pemegang pepper (operator) bisa menghitung `seed` server mana pun, dan counter `n` tersimpan di DB yang ia kelola. Artinya ia bisa menghitung **hasil ayunan berikutnya** setiap pemain di setiap node sebelum ayunan itu terjadi, lalu memakai informasi itu (memilih node/waktu untuk akunnya sendiri, atau membocorkannya ke pemain tertentu).
 
-Yang **tidak** bisa ia lakukan: mengubah hasil percobaan yang sudah terjadi (roll tetap bisa dihitung ulang siapa pun setelah pepper dibuka) atau mengulang nomor percobaan (counter hanya bisa naik). Pemain biasa tidak bisa memprediksi roll karena tidak tahu pepper.
+Pemain biasa tidak bisa memprediksi roll karena tidak tahu pepper. Counter `n` juga tidak bisa dimundurkan atau dihapus lewat API, termasuk dengan key service_role (trigger menolaknya). Batas perlindungan ini:
+
+- Pemilik project Supabase bisa menghapus trigger lewat SQL Editor lalu memundurkan counter. Trigger melindungi dari pemegang key, bukan dari pemilik database.
+- Belum ada log per ayunan (node, `n`, hasil). Setelah pepper dibuka, roll bisa dihitung ulang, tapi belum bisa dicocokkan dengan riwayat ayunan yang sebenarnya terjadi.
 
 **Rencana mitigasi (BELUM aktif):** masukkan randomness drand ke pre-image roll:
 
