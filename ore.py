@@ -916,6 +916,7 @@ def _print_ore_item(item: OreItem, rarity_score: float, label: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from world_stream import test_seed
     import hashlib as _hl
 
     print()
@@ -941,12 +942,9 @@ if __name__ == "__main__":
     miner     = MiningEngine()
 
     # ── Neon Spire: a real pipeline run (the Copper world) ───────────────────
-    neon_spire_profile = g_engine.generate_profile(
-        server_id  = 100_000_000_000_000_001,
-        created_at = 1_577_836_800,
-    )
-    neon_spire_catalog = m_engine.generate_geology(neon_spire_profile)
-    neon_spire_state   = spawner.initialise(neon_spire_profile, neon_spire_catalog)
+    neon_spire_profile = g_engine.generate_profile(server_id=100_000_000_000_000_001, seed=test_seed(f"{100_000_000_000_000_001}:{1_577_836_800}"), created_at=1_577_836_800)
+    neon_spire_catalog = m_engine.generate_geology(neon_spire_profile, test_seed(f"{neon_spire_profile.server_id}:{neon_spire_profile.created_at}"))
+    neon_spire_state   = spawner.initialise(neon_spire_profile, neon_spire_catalog, test_seed(f"{neon_spire_profile.server_id}:{neon_spire_profile.created_at}"))
 
     print(f"  ✓ Neon Spire profile generated")
     print(f"    dominant_metal  = {neon_spire_profile.dominant_metal_element.symbol} "
@@ -980,8 +978,8 @@ if __name__ == "__main__":
         biome_affinity             = ("IRRADIATED_WASTES", "VOLCANIC", "NETHER_DEPTHS"),
         world_flavour_tags         = ("IRRADIATED", "MUTATION_HOTSPOT", "FISSION_WORLD"),
     )
-    uranium_catalog = m_engine.generate_geology(uranium_profile)
-    uranium_state   = spawner.initialise(uranium_profile, uranium_catalog)
+    uranium_catalog = m_engine.generate_geology(uranium_profile, test_seed(f"{uranium_profile.server_id}:{uranium_profile.created_at}"))
+    uranium_state   = spawner.initialise(uranium_profile, uranium_catalog, test_seed(f"{uranium_profile.server_id}:{uranium_profile.created_at}"))
 
     print(f"  ✓ Uranium world profile constructed (Scenario A)")
     print(f"    dominant_metal  = {uranium_profile.dominant_metal_element.symbol} "

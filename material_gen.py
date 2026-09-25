@@ -54,6 +54,8 @@ ENTROPY CURSOR MAP  (sub-seed hex stream → fields)
 from __future__ import annotations
 
 import hashlib
+
+from world_stream import DOMAIN_MATERIAL, DomainStream
 import json
 import sys
 import os
@@ -74,7 +76,6 @@ from identitas_genetik import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MAX_UINT16: int = 0xFFFF          # 65535 — denominator for 16-bit unit mapping
-_MATERIAL_SALT: bytes = b"material_salt_v2"
 
 # ── Depth layer ordering (surface → abyss) ────────────────────────────────────
 DEPTH_LAYERS: Tuple[str, ...] = ("SURFACE", "SHALLOW", "DEEP", "ABYSS")
@@ -360,60 +361,33 @@ class ServerMaterialCatalog:
 
 class _EntropyStream:
     """
-    Sequential deterministic entropy source derived from a SHA-256 sub-seed.
+    Sequential view over the Stage-2 stream  stream(seed, "material", i).
 
-    The 64-char hex digest is consumed as a stream of 4-char windows
-    (16-bit uints, range 0-65535).  Once the primary stream is exhausted
-    (16 windows = 64 chars), the stream continues by re-hashing with an
-    extension counter:  SHA-256(primary_digest + counter.to_bytes(2, 'big'))
-
-    This gives an unlimited, deterministic, cross-platform entropy stream
-    with zero `random` module dependency.
+    Every draw consumes exactly one index i (0, 1, 2, …), so the material
+    domain is independent of every other domain and effectively unbounded.
+    Zero `random` module dependency.
     """
 
-    _WINDOW: int       = 4          # hex chars per window
-    _MAX_U16: int      = 0xFFFF     # 65535
-    _WINDOWS_PER_HASH: int = 16     # 64 hex / 4 per window
-
-    def __init__(self, genetic_signature: str) -> None:
-        primary_hash = hashlib.sha256(
-            genetic_signature.encode("utf-8") + _MATERIAL_SALT
-        ).hexdigest()
-        self._primary: str = primary_hash
-        self._extension_counter: int = 0
-        self._cursor: int = 0        # window index within current block
-        self._current_block: str = primary_hash
+    def __init__(self, seed: bytes) -> None:
+        self._stream = DomainStream(seed, DOMAIN_MATERIAL)
 
     # ── Core consumption ──────────────────────────────────────────────────
 
     def next_uint16(self) -> int:
-        """Return the next 16-bit unsigned integer from the stream."""
-        if self._cursor >= self._WINDOWS_PER_HASH:
-            # Extend the stream deterministically
-            self._extension_counter += 1
-            ext = hashlib.sha256(
-                self._primary.encode("utf-8")
-                + self._extension_counter.to_bytes(2, "big")
-            ).hexdigest()
-            self._current_block = ext
-            self._cursor = 0
-
-        start = self._cursor * self._WINDOW
-        window = self._current_block[start : start + self._WINDOW]
-        self._cursor += 1
-        return int(window, 16)
+        """Top 16 bits of the next stream value."""
+        return self._stream.next_int() >> 240
 
     def next_unit(self) -> float:
-        """Return a float in [0.0, 1.0]."""
-        return self.next_uint16() / self._MAX_U16
+        """Return a float in [0.0, 1.0) (53-bit, world_stream.unit)."""
+        return self._stream.next_unit()
 
     def next_in_range(self, lo: float, hi: float) -> float:
         """Return a float in [lo, hi]."""
         return lo + self.next_unit() * (hi - lo)
 
     def next_index(self, n: int) -> int:
-        """Return an integer in [0, n-1] via modulo (n ≤ 65536)."""
-        return self.next_uint16() % n
+        """Return an integer in [0, n-1] (full 256-bit modulo, negligible bias)."""
+        return self._stream.next_below(n)
 
     def next_tier(self, tiers: Tuple, thresholds: Tuple[float, ...]) -> str:
         """
@@ -681,11 +655,10 @@ class MaterialEngine:
     """
     Deterministic Crustal & Geological Generation Engine.
 
-    Entry point: MaterialEngine.generate_geology(profile) → ServerMaterialCatalog
+    Entry point: MaterialEngine.generate_geology(profile, seed) → ServerMaterialCatalog
 
     The engine strictly never imports `random` or `numpy.random`.
-    All parameters are derived from a deterministic entropy stream seeded by:
-        SHA-256(profile.genetic_signature.encode() + b"material_salt_v2")
+    All parameters are derived from the Stage-2 stream  stream(seed, "material", i).
 
     Generation Pipeline
     ───────────────────
@@ -715,6 +688,7 @@ class MaterialEngine:
     def generate_geology(
         self,
         profile: ServerGeneticProfile,
+        seed:    bytes,
     ) -> ServerMaterialCatalog:
         """
         Derive an immutable ServerMaterialCatalog from *profile*.
@@ -723,15 +697,13 @@ class MaterialEngine:
         ----------
         profile : ServerGeneticProfile — frozen genetic baseline from
                   identitas_genetik.GeneticEngine.generate_profile()
+        seed    : the SAME 32-byte Stage-1 seed the profile was generated from
 
         Returns
         -------
         ServerMaterialCatalog — fully deterministic, frozen, cross-platform.
         """
-        # Guard: never mutate the upstream profile
-        assert profile.genetic_signature, "Profile must have a valid genetic_signature"
-
-        stream = _EntropyStream(profile.genetic_signature)
+        stream = _EntropyStream(seed)   # validates the seed (32 bytes)
 
         # ═════════════════════════════════════════════════════════════════
         # STEP 1 — MACRO GEOLOGICAL PARAMETERS
@@ -1112,6 +1084,7 @@ def _print_catalog(catalog: ServerMaterialCatalog, label: str) -> None:
 
 
 if __name__ == "__main__":
+    from world_stream import test_seed
 
     engine   = MaterialEngine()
     g_engine = GeneticEngine()
@@ -1157,7 +1130,7 @@ if __name__ == "__main__":
         sec_nm_sym            = "F",   sec_nm_name="Fluorine",    sec_nm_cat="reactive nonmetal",   sec_nm_rw=350,     sec_nm_an=9,
     )
 
-    uranium_catalog = engine.generate_geology(uranium_profile)
+    uranium_catalog = engine.generate_geology(uranium_profile, test_seed(f"{uranium_profile.server_id}:{uranium_profile.created_at}"))
     _print_catalog(uranium_catalog, "SCENARIO A — High-Volatility URANIUM World (PRIMORDIAL)")
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1192,7 +1165,7 @@ if __name__ == "__main__":
         sec_nm_sym            = "Si",  sec_nm_name="Silicon",     sec_nm_cat="metalloid",                sec_nm_rw=850,     sec_nm_an=14,
     )
 
-    iron_catalog = engine.generate_geology(iron_profile)
+    iron_catalog = engine.generate_geology(iron_profile, test_seed(f"{iron_profile.server_id}:{iron_profile.created_at}"))
     _print_catalog(iron_catalog, "SCENARIO B — Highly Stable IRON World (ANCIENT)")
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1200,11 +1173,8 @@ if __name__ == "__main__":
     # Uses "Neon Spire" from identitas_genetik test vectors (Fe dominant)
     # ─────────────────────────────────────────────────────────────────────
 
-    neon_spire_profile = g_engine.generate_profile(
-        server_id  = 100000000000000001,
-        created_at = 1577836800,
-    )
-    neon_spire_catalog = engine.generate_geology(neon_spire_profile)
+    neon_spire_profile = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800)
+    neon_spire_catalog = engine.generate_geology(neon_spire_profile, test_seed(f"{neon_spire_profile.server_id}:{neon_spire_profile.created_at}"))
     _print_catalog(neon_spire_catalog, "SCENARIO C — LIVE PROFILE: Neon Spire (100000000000000001)")
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1219,8 +1189,8 @@ if __name__ == "__main__":
     for label, profile in [("Uranium World", uranium_profile),
                             ("Iron World",    iron_profile),
                             ("Neon Spire",    neon_spire_profile)]:
-        c1 = engine.generate_geology(profile)
-        c2 = engine.generate_geology(profile)
+        c1 = engine.generate_geology(profile, test_seed(f"{profile.server_id}:{profile.created_at}"))
+        c2 = engine.generate_geology(profile, test_seed(f"{profile.server_id}:{profile.created_at}"))
         checks = [
             c1.geological_rating         == c2.geological_rating,
             c1.tectonic_activity         == c2.tectonic_activity,

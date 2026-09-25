@@ -1,0 +1,547 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║         DB_EKONOMI_PUSAT.PY  —  Supabase Persistence Layer                   ║
+║         "db.ekonomi.pusat" — satu-satunya file yang bicara dengan Supabase   ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  TABEL (lihat supabase/schema.sql)                                           ║
+║  ─────────────────────────────────────────────────────────────────────────  ║
+║  players       (guild_id, user_id) → wallet, xp, level, voice, bag, ...    ║
+║  currencies    guild_id → CurrencyManifest dari currency_engine.py         ║
+║  voice_config  guild_id → VoiceConfig dari voice_engine.py                 ║
+║  server_registry / world_nonces  → Stage 0 (insert-only, world_registry)   ║
+║                                                                              ║
+║  DESIGN                                                                      ║
+║  ─────────────────────────────────────────────────────────────────────────  ║
+║  • Semua method SINKRON (supabase-py sync client).  main_core.py wajib     ║
+║    memanggilnya lewat executor agar event loop Discord tidak tersendat.    ║
+║  • Tidak tahu apa-apa soal PlayerProfile — player diterima/dikembalikan    ║
+║    sebagai dict baris; konversinya ada di main_core.PlayerProfile.         ║
+║  • Kolom eksplisit (bukan satu blob JSON) supaya dashboard web ekonomi     ║
+║    nanti bisa query statistik langsung.                                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from datetime import datetime, timezone
+from typing import Dict, List, Mapping, Optional, Sequence, Set
+from urllib.parse import urlparse
+
+from supabase import Client, create_client
+
+from currency_engine import CurrencyManifest, CurrencyPolicy
+from voice_engine import VoiceConfig
+
+
+TABLE_PLAYERS: str = "players"
+TABLE_CURRENCIES: str = "currencies"
+TABLE_VOICE_CONFIG: str = "voice_config"
+TABLE_SERVER_REGISTRY: str = "server_registry"
+TABLE_WORLD_NONCES: str = "world_nonces"
+TABLE_WORLD_COMMITMENTS: str = "world_commitments"
+TABLE_WORLD_WITNESS_LOG: str = "world_witness_log"
+
+# Kolom yang WAJIB ada; dicek saat startup supaya migrasi yang terlewat
+# langsung ketahuan, bukan gagal diam-diam di setiap flush.
+_REQUIRED_COLUMNS = {
+    TABLE_PLAYERS: (
+        "guild_id,user_id,stamina,pickaxe_key,wallet,xp,level,voice_seconds,"
+        "ore_bag,crystal_bag,automine"
+    ),
+    TABLE_CURRENCIES: (
+        "guild_id,currency_name,ticker,genesis_market_cap,total_supply,circulating_supply,"
+        "reserve_supply,exchange_rate_to_ua,geological_backing_value_ua,policy,"
+        "genesis_timestamp,founding_geology_score,is_active"
+    ),
+    TABLE_VOICE_CONFIG: (
+        "guild_id,notify_channel_id,reward_interval_minutes,reward_amount,"
+        "block_self_mute_deaf,block_afk_channel,block_alone"
+    ),
+    TABLE_SERVER_REGISTRY: "guild_id,algo_version,randomness_source,registered_at",
+    TABLE_WORLD_NONCES: "guild_id,drand_round,world_nonce,drand_signature,fetched_at",
+    TABLE_WORLD_COMMITMENTS: "algo_version,pepper_commitment,committed_at",
+    TABLE_WORLD_WITNESS_LOG: "event_key,event_id,delivered_at",
+}
+
+# PostgREST membatasi 1000 baris per response secara default.
+_PAGE_SIZE: int = 1000
+_UPSERT_CHUNK: int = 500
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_supabase_url(url: str) -> str:
+    """
+    supabase-py expects the bare project URL (https://<ref>.supabase.co) and
+    appends /rest/v1 itself.  The dashboard also shows the REST URL ending in
+    /rest/v1, which would produce /rest/v1/rest/v1/... → PGRST125.  Accept both.
+    """
+    clean = url.strip().rstrip("/")
+    if clean.endswith("/rest/v1"):
+        clean = clean[: -len("/rest/v1")]
+    return clean
+
+
+class NotSupabaseResponse(RuntimeError):
+    """The endpoint answered, but not as the Supabase REST API (e.g. an HTML page)."""
+
+
+_URL_HINT = ("Isi dengan 'Project URL' dari Settings → API (bentuknya https://<ref>.supabase.co), "
+             "BUKAN URL dashboard di browser.")
+
+
+def _rows(data: object, what: str) -> List[dict]:
+    """A PostgREST table/RPC-setof response must be a list of objects — anything else is refused."""
+    if not isinstance(data, list) or any(not isinstance(r, dict) for r in data):
+        raise NotSupabaseResponse(
+            f"{what}: respons bukan dari API Supabase (dapat {type(data).__name__}"
+            f"{', diawali ' + repr(data[:15]) if isinstance(data, str) else ''}). {_URL_HINT}"
+        )
+    return data
+
+
+def validate_supabase_url(url: str, env_name: str) -> str:
+    """Reject URLs that cannot be a Supabase API root (dashboard links, extra paths)."""
+    parsed = urlparse(normalize_supabase_url(url))
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host or parsed.path not in ("", "/") \
+            or host == "supabase.com" or host.endswith(".supabase.com"):
+        raise RuntimeError(f"{env_name} tidak terlihat seperti URL API Supabase. {_URL_HINT}")
+    return normalize_supabase_url(url)
+
+
+def connect_test_database(env: Mapping[str, str]) -> Client:
+    """
+    Client ke project Supabase KHUSUS TES (SUPABASE_TEST_URL / SUPABASE_TEST_KEY).
+    Menolak kalau belum diisi, atau kalau host-nya sama dengan SUPABASE_URL
+    utama — tes live yang menulis baris permanen tidak boleh menyentuh produksi.
+    """
+    test_url = normalize_supabase_url(env.get("SUPABASE_TEST_URL", ""))
+    test_key = env.get("SUPABASE_TEST_KEY", "").strip()
+    if not test_url or not test_key:
+        raise RuntimeError("SUPABASE_TEST_URL / SUPABASE_TEST_KEY belum diisi di .env — tes live menolak jalan.")
+    test_host = (urlparse(test_url).hostname or "").lower()
+    main_host = (urlparse(normalize_supabase_url(env.get("SUPABASE_URL", ""))).hostname or "").lower()
+    if not test_host:
+        raise RuntimeError("SUPABASE_TEST_URL tidak valid.")
+    if test_host == main_host:
+        raise RuntimeError("SUPABASE_TEST_URL menunjuk ke project yang SAMA dengan SUPABASE_URL utama — tes menolak jalan.")
+    return create_client(validate_supabase_url(test_url, "SUPABASE_TEST_URL"), test_key)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KONVERSI BARIS ⇄ DATACLASS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def manifest_to_row(manifest: CurrencyManifest) -> dict:
+    return {
+        "guild_id":                    manifest.server_id,
+        "currency_name":               manifest.currency_name,
+        "ticker":                      manifest.ticker,
+        "genesis_market_cap":          manifest.genesis_market_cap,
+        "total_supply":                manifest.total_supply,
+        "circulating_supply":          manifest.circulating_supply,
+        "reserve_supply":              manifest.reserve_supply,
+        "exchange_rate_to_ua":         manifest.exchange_rate_to_ua,
+        "geological_backing_value_ua": manifest.geological_backing_value_ua,
+        "policy":                      dataclasses.asdict(manifest.policy),
+        "genesis_timestamp":           manifest.genesis_timestamp,
+        "founding_geology_score":      manifest.founding_geology_score,
+        "is_active":                   manifest.is_active,
+    }
+
+
+def row_to_manifest(row: dict) -> CurrencyManifest:
+    # float() di mana-mana: PostgREST mengembalikan 1000.0 sebagai 1000 (int).
+    p = row["policy"]
+    return CurrencyManifest(
+        server_id                   = int(row["guild_id"]),
+        currency_name               = row["currency_name"],
+        ticker                      = row["ticker"],
+        genesis_market_cap          = float(row["genesis_market_cap"]),
+        total_supply                = float(row["total_supply"]),
+        circulating_supply          = float(row["circulating_supply"]),
+        reserve_supply              = float(row["reserve_supply"]),
+        exchange_rate_to_ua         = float(row["exchange_rate_to_ua"]),
+        geological_backing_value_ua = float(row["geological_backing_value_ua"]),
+        policy = CurrencyPolicy(
+            hard_cap_supply             = float(p["hard_cap_supply"]),
+            max_circulating_supply      = float(p["max_circulating_supply"]),
+            reserve_ratio               = float(p["reserve_ratio"]),
+            founding_geology_score      = float(p["founding_geology_score"]),
+            geological_backing_value_ua = float(p["geological_backing_value_ua"]),
+        ),
+        genesis_timestamp           = row["genesis_timestamp"],
+        founding_geology_score      = float(row["founding_geology_score"]),
+        is_active                   = bool(row["is_active"]),
+    )
+
+
+def voice_config_to_row(config: VoiceConfig) -> dict:
+    return dataclasses.asdict(config)
+
+
+def row_to_voice_config(row: dict) -> VoiceConfig:
+    return VoiceConfig(
+        guild_id                = int(row["guild_id"]),
+        notify_channel_id       = int(row["notify_channel_id"]) if row["notify_channel_id"] is not None else None,
+        reward_interval_minutes = int(row["reward_interval_minutes"]),
+        reward_amount           = float(row["reward_amount"]),
+        block_self_mute_deaf    = bool(row["block_self_mute_deaf"]),
+        block_afk_channel       = bool(row["block_afk_channel"]),
+        block_alone             = bool(row["block_alone"]),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATABASE GATEWAY
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EconomyDatabase:
+    """Gateway sinkron ke Supabase untuk semua state ekonomi yang persisten."""
+
+    def __init__(self, client: Client) -> None:
+        self._db = client
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _select_all(self, table: str, order_by: Sequence[str]) -> List[dict]:
+        rows: List[dict] = []
+        start = 0
+        while True:
+            query = self._db.table(table).select("*")
+            for col in order_by:
+                query = query.order(col)
+            # _rows() also stops a non-API endpoint from looping forever here
+            # (an HTML string "looks like" thousands of rows to len()).
+            page = _rows(query.range(start, start + _PAGE_SIZE - 1).execute().data, f"select {table}")
+            rows.extend(page)
+            if len(page) < _PAGE_SIZE:
+                return rows
+            start += _PAGE_SIZE
+
+    # ── Startup check ─────────────────────────────────────────────────────────
+
+    def verify_schema(self) -> None:
+        """Gagal cepat dengan pesan jelas kalau tabel belum dibuat / key salah."""
+        for table, columns in _REQUIRED_COLUMNS.items():
+            try:
+                _rows(self._db.table(table).select(columns).limit(1).execute().data, f"tabel {table}")
+            except NotSupabaseResponse:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Tidak bisa membaca tabel Supabase '{table}': {exc}\n"
+                    f"→ Jalankan ulang SELURUH supabase/schema.sql di SQL Editor (aman diulang; "
+                    f"berisi migrasi kolom baru), pastikan SUPABASE_URL benar, dan SUPABASE_KEY "
+                    f"adalah key service_role / secret."
+                ) from exc
+
+    # ── Players ───────────────────────────────────────────────────────────────
+
+    def load_player_rows(self) -> List[dict]:
+        return self._select_all(TABLE_PLAYERS, ("guild_id", "user_id"))
+
+    def upsert_player_rows(self, rows: Sequence[dict]) -> None:
+        stamp = _utc_now_iso()
+        payload = [{**row, "updated_at": stamp} for row in rows]
+        for i in range(0, len(payload), _UPSERT_CHUNK):
+            self._db.table(TABLE_PLAYERS).upsert(
+                payload[i:i + _UPSERT_CHUNK], on_conflict="guild_id,user_id"
+            ).execute()
+
+    # ── Currencies ────────────────────────────────────────────────────────────
+
+    def load_currencies(self) -> Dict[int, CurrencyManifest]:
+        return {
+            int(row["guild_id"]): row_to_manifest(row)
+            for row in self._select_all(TABLE_CURRENCIES, ("guild_id",))
+        }
+
+    def upsert_currency(self, manifest: CurrencyManifest) -> None:
+        row = {**manifest_to_row(manifest), "updated_at": _utc_now_iso()}
+        self._db.table(TABLE_CURRENCIES).upsert(row, on_conflict="guild_id").execute()
+
+    # ── Voice config ──────────────────────────────────────────────────────────
+
+    def load_voice_configs(self) -> Dict[int, VoiceConfig]:
+        return {
+            int(row["guild_id"]): row_to_voice_config(row)
+            for row in self._select_all(TABLE_VOICE_CONFIG, ("guild_id",))
+        }
+
+    def upsert_voice_config(self, config: VoiceConfig) -> None:
+        row = {**voice_config_to_row(config), "updated_at": _utc_now_iso()}
+        self._db.table(TABLE_VOICE_CONFIG).upsert(row, on_conflict="guild_id").execute()
+
+    # ── Stage 0: server registry (insert-only; see world_registry.py) ─────────
+
+    def register_server_row(self, guild_id: int, algo_version: str, source_id: str) -> dict:
+        """Atomic insert-or-get via the register_server() SQL function."""
+        rows = _rows(self._db.rpc("register_server", {
+            "p_guild_id": guild_id, "p_algo_version": algo_version, "p_source": source_id,
+        }).execute().data, "rpc register_server")
+        if not rows:
+            raise RuntimeError(f"register_server tidak mengembalikan baris untuk guild {guild_id}")
+        return rows[0]
+
+    def get_world_nonce_row(self, guild_id: int) -> Optional[dict]:
+        rows = _rows(self._db.table(TABLE_WORLD_NONCES).select("*").eq("guild_id", guild_id).execute().data,
+                     f"select {TABLE_WORLD_NONCES}")
+        return rows[0] if rows else None
+
+    def insert_world_nonce_row(self, guild_id: int, drand_round: int, world_nonce: str, signature: str) -> None:
+        # ON CONFLICT DO NOTHING: two workers storing the same beacon is harmless;
+        # the first stored row always wins and is what callers read back.
+        self._db.table(TABLE_WORLD_NONCES).upsert({
+            "guild_id": guild_id, "drand_round": drand_round,
+            "world_nonce": world_nonce, "drand_signature": signature,
+        }, on_conflict="guild_id", ignore_duplicates=True).execute()
+
+    def load_registry_rows(self) -> List[dict]:
+        return self._select_all(TABLE_SERVER_REGISTRY, ("guild_id",))
+
+    def load_world_nonce_rows(self) -> List[dict]:
+        return self._select_all(TABLE_WORLD_NONCES, ("guild_id",))
+
+    # ── Stage 1: pepper commitments (insert-only; see world_seed.py) ──────────
+
+    def get_commitment_row(self, algo_version: str) -> Optional[dict]:
+        rows = _rows(self._db.table(TABLE_WORLD_COMMITMENTS).select("*").eq("algo_version", algo_version)
+                     .execute().data, f"select {TABLE_WORLD_COMMITMENTS}")
+        return rows[0] if rows else None
+
+    def insert_commitment_row(self, algo_version: str, commitment: str) -> None:
+        self._db.table(TABLE_WORLD_COMMITMENTS).upsert(
+            {"algo_version": algo_version, "pepper_commitment": commitment},
+            on_conflict="algo_version", ignore_duplicates=True,
+        ).execute()
+
+    def load_commitment_rows(self) -> List[dict]:
+        return self._select_all(TABLE_WORLD_COMMITMENTS, ("algo_version",))
+
+    # ── External witness outbox (insert-only; see world_witness.py) ───────────
+
+    def load_witness_keys(self) -> Set[str]:
+        return {row["event_key"] for row in self._select_all(TABLE_WORLD_WITNESS_LOG, ("event_key",))}
+
+    def insert_witness_row(self, event_key: str, event_id: str) -> None:
+        self._db.table(TABLE_WORLD_WITNESS_LOG).upsert(
+            {"event_key": event_key, "event_id": event_id},
+            on_conflict="event_key", ignore_duplicates=True,
+        ).execute()
+
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+
+    def security_report(self) -> dict:
+        data = self._db.rpc("security_report", {}).execute().data
+        if not isinstance(data, dict) or "caller_role" not in data:
+            raise NotSupabaseResponse(f"rpc security_report: respons bukan dari API Supabase. {_URL_HINT}")
+        return data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SELF-TEST
+#   python db_ekonomi_pusat.py             → tes konversi offline (tanpa network)
+#   python db_ekonomi_pusat.py --live      → + tulis/baca/hapus di project TES
+#                                            (SUPABASE_TEST_*), guild_id 0
+#   python db_ekonomi_pusat.py --security  → laporan RLS/hak akses project utama
+#                                            (read-only) + uji anon di project TES
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import json
+    import os
+    import sys
+    from types import SimpleNamespace
+
+    failures = 0
+
+    def check(label: str, got, expected) -> None:
+        global failures
+        ok = got == expected
+        failures += 0 if ok else 1
+        print(f"  {'✓' if ok else '✗'}  {label}" + ("" if ok else f"\n      got      {got!r}\n      expected {expected!r}"))
+
+    def over_the_wire(row: dict) -> dict:
+        # Simulasikan JSON transport PostgREST: float bulat kembali sebagai int.
+        text = json.dumps(row).replace(".0,", ",").replace(".0}", "}")
+        return json.loads(text)
+
+    TEST_GUILD = 0
+    policy = CurrencyPolicy(2000.0, 800.0, 0.2, 900.0, 675.0)
+    manifest = CurrencyManifest(
+        server_id=TEST_GUILD, currency_name="Uji Dollar", ticker="ZZUJI",
+        genesis_market_cap=600.0, total_supply=1000.0, circulating_supply=800.0,
+        reserve_supply=200.0, exchange_rate_to_ua=0.75, geological_backing_value_ua=675.0,
+        policy=policy, genesis_timestamp="2026-01-01T00:00:00+00:00",
+        founding_geology_score=900.0, is_active=True,
+    )
+    vcfg = VoiceConfig(guild_id=TEST_GUILD, notify_channel_id=1234567890123456789,
+                       reward_interval_minutes=3, reward_amount=12.5, block_alone=False)
+
+    print("\n[offline] Konversi baris ⇄ dataclass")
+    check("CurrencyManifest round-trip", row_to_manifest(over_the_wire(manifest_to_row(manifest))), manifest)
+    check("VoiceConfig round-trip", row_to_voice_config(over_the_wire(voice_config_to_row(vcfg))), vcfg)
+    no_channel = dataclasses.replace(vcfg, notify_channel_id=None)
+    check("VoiceConfig tanpa channel", row_to_voice_config(over_the_wire(voice_config_to_row(no_channel))), no_channel)
+
+    print("\n[offline] Penjaga DB tes (SUPABASE_TEST_*)")
+    PROD = "https://prodref.supabase.co"
+    for label, env in [
+        ("belum diisi → tolak", {"SUPABASE_URL": PROD}),
+        ("sama persis → tolak", {"SUPABASE_URL": PROD, "SUPABASE_TEST_URL": PROD, "SUPABASE_TEST_KEY": "k"}),
+        ("sama tapi pakai /rest/v1/ & huruf besar → tolak",
+         {"SUPABASE_URL": PROD, "SUPABASE_TEST_URL": "https://PRODREF.supabase.co/rest/v1/", "SUPABASE_TEST_KEY": "k"}),
+    ]:
+        try:
+            connect_test_database(env)
+            check(label, "diterima", "RuntimeError")
+        except RuntimeError:
+            check(label, "RuntimeError", "RuntimeError")
+    try:
+        connect_test_database({"SUPABASE_URL": PROD, "SUPABASE_TEST_KEY": "k",
+                               "SUPABASE_TEST_URL": "https://supabase.com/dashboard/project/testref"})
+        check("URL dashboard → tolak", "diterima", "RuntimeError")
+    except RuntimeError:
+        check("URL dashboard → tolak", "RuntimeError", "RuntimeError")
+
+    class _HtmlEndpoint:
+        """Mimics supabase-py against a web page: every call 'succeeds' with an HTML string."""
+        calls = 0
+        def __getattr__(self, _name):
+            return lambda *a, **k: self
+        def execute(self):
+            _HtmlEndpoint.calls += 1
+            if _HtmlEndpoint.calls > 5:
+                raise AssertionError("loop tanpa henti")
+            return SimpleNamespace(data="<!DOCTYPE html>" + "x" * 5000)
+
+    html_gw = EconomyDatabase(_HtmlEndpoint())
+    for label, fn in [("verify_schema", html_gw.verify_schema), ("load_player_rows", html_gw.load_player_rows),
+                      ("register_server_row", lambda: html_gw.register_server_row(1, "v1", "s"))]:
+        _HtmlEndpoint.calls = 0
+        try:
+            fn()
+            check(f"endpoint HTML → {label} menolak", "lolos", "NotSupabaseResponse")
+        except NotSupabaseResponse:
+            check(f"endpoint HTML → {label} menolak (tanpa loop)", "NotSupabaseResponse", "NotSupabaseResponse")
+        except AssertionError as exc:
+            check(f"endpoint HTML → {label} menolak", str(exc), "NotSupabaseResponse")
+
+    check("project beda → diterima",
+          connect_test_database({"SUPABASE_URL": PROD, "SUPABASE_TEST_URL": "https://testref.supabase.co",
+                                 "SUPABASE_TEST_KEY": "sb_secret_dummy"}) is not None, True)
+
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+    def fail(message: str) -> None:
+        print(f"\n✗ {message}\n")
+        raise SystemExit(1)
+
+    if "--live" in sys.argv:
+        try:
+            gw = EconomyDatabase(connect_test_database(os.environ))   # never the production project
+        except RuntimeError as exc:
+            fail(str(exc))
+        raw = gw._db
+
+        print("\n[live] Supabase TES (baris uji guild_id=0, dihapus di akhir)")
+        try:
+            gw.verify_schema()
+            check("verify_schema", True, True)
+
+            gw.upsert_currency(manifest)
+            check("currency tersimpan & terbaca", gw.load_currencies().get(TEST_GUILD, None) is not None, True)
+            loaded = gw.load_currencies()[TEST_GUILD]
+            check("currency sama persis (kecuali format timestamp)",
+                  dataclasses.replace(loaded, genesis_timestamp=manifest.genesis_timestamp), manifest)
+
+            gw.upsert_voice_config(vcfg)
+            check("voice_config round-trip", gw.load_voice_configs().get(TEST_GUILD), vcfg)
+
+            player_row = {
+                "guild_id": TEST_GUILD, "user_id": 42, "stamina": 55.5, "pickaxe_key": "iron_standard",
+                "wallet": 123.4567, "xp": 250, "level": 2, "voice_seconds": 901.25,
+                "ore_bag": [{"item_uuid": "abc", "owner_id": 42, "server_id": 1234567890123456789}],
+                "crystal_bag": [], "automine": True,
+            }
+            gw.upsert_player_rows([player_row])
+            gw.upsert_player_rows([{**player_row, "wallet": 200.0}])          # update, bukan duplikat
+            mine = [r for r in gw.load_player_rows() if r["guild_id"] == TEST_GUILD]
+            check("player: tepat 1 baris setelah 2x upsert", len(mine), 1)
+            check("player: wallet ter-update", float(mine[0]["wallet"]), 200.0)
+            check("player: snowflake di jsonb utuh", mine[0]["ore_bag"][0]["server_id"], 1234567890123456789)
+            check("player: status automine tersimpan", mine[0]["automine"], True)
+        finally:
+            # Jangan sampai error cleanup menutupi error aslinya.
+            try:
+                for table in (TABLE_PLAYERS, TABLE_CURRENCIES, TABLE_VOICE_CONFIG):
+                    raw.table(table).delete().eq("guild_id", TEST_GUILD).execute()
+                print("  ·  baris uji guild_id=0 dihapus")
+            except Exception:
+                print("  ·  cleanup dilewati (tabel tidak bisa diakses)")
+
+    if "--security" in sys.argv:
+        # Read-only report from the PRODUCTION project + behavioural anon checks
+        # against the TEST project (a failed check there cannot pollute prod).
+        BOT_TABLES = {TABLE_PLAYERS, TABLE_CURRENCIES, TABLE_VOICE_CONFIG, TABLE_SERVER_REGISTRY,
+                      TABLE_WORLD_NONCES, TABLE_WORLD_COMMITMENTS, TABLE_WORLD_WITNESS_LOG}
+        BOT_FUNCTIONS = {"register_server(bigint,text,text)", "security_report()"}
+
+        prod = EconomyDatabase(create_client(normalize_supabase_url(os.getenv("SUPABASE_URL", "")),
+                                             os.getenv("SUPABASE_KEY", "")))
+        try:
+            report = prod.security_report()
+        except Exception as exc:
+            fail("security_report() belum ada di project UTAMA → jalankan ulang SELURUH supabase/schema.sql "
+                 f"(v4) di SQL Editor project utama.\n  detail: {exc}")
+        print("\n[security] Project UTAMA (read-only)")
+        check("key bot berjalan sebagai role", report["caller_role"], "service_role")
+        check("role itu bypass RLS", report["caller_bypasses_rls"], True)
+        for t in sorted((r for r in report["tables"] if r["table"] in BOT_TABLES), key=lambda r: r["table"]):
+            check(f"{t['table']:<18} RLS aktif, 0 policy, anon/auth tanpa hak",
+                  (t["rls_enabled"], t["policies"], t["anon_insert"], t["anon_select"], t["auth_insert"]),
+                  (True, 0, False, False, False))
+        check("semua tabel bot ada di laporan", BOT_TABLES <= {r["table"] for r in report["tables"]}, True)
+        for f in (r for r in report["functions"] if r["function"] in BOT_FUNCTIONS):
+            check(f"{f['function']:<34} tidak bisa dipanggil anon/auth",
+                  (f["anon_execute"], f["auth_execute"]), (False, False))
+
+        anon_key = os.getenv("SUPABASE_TEST_ANON_KEY", "").strip()
+        if not anon_key:
+            print("  ·  SUPABASE_TEST_ANON_KEY kosong → uji perilaku anon dilewati")
+        else:
+            try:
+                connect_test_database(os.environ)      # same guard: must not be the prod host
+            except RuntimeError as exc:
+                fail(str(exc))
+            anon = create_client(normalize_supabase_url(os.environ["SUPABASE_TEST_URL"]), anon_key)
+            print("\n[security] Uji perilaku dengan key ANON di project TES")
+            for label, action in [
+                ("anon INSERT server_registry",
+                 lambda: anon.table(TABLE_SERVER_REGISTRY).insert(
+                     {"guild_id": -999, "algo_version": "v1", "randomness_source": "x"}).execute()),
+                ("anon INSERT world_nonces",
+                 lambda: anon.table(TABLE_WORLD_NONCES).insert(
+                     {"guild_id": -999, "drand_round": 1, "world_nonce": "0" * 64, "drand_signature": "0" * 96}).execute()),
+                ("anon RPC register_server",
+                 lambda: anon.rpc("register_server", {"p_guild_id": -999, "p_algo_version": "v1", "p_source": "x"}).execute()),
+                ("anon SELECT world_nonces",
+                 lambda: anon.table(TABLE_WORLD_NONCES).select("*").limit(1).execute()),
+            ]:
+                try:
+                    data = action().data
+                except Exception:
+                    check(label, "ditolak", "ditolak")
+                    continue
+                # No exception: only a real PostgREST payload counts as "accepted".
+                is_api = isinstance(data, (list, dict))
+                check(label, "DITERIMA" if is_api else f"respons bukan API Supabase — {_URL_HINT}", "ditolak")
+
+    print(f"\n{'SEMUA TES LULUS ✓' if failures == 0 else f'{failures} TES GAGAL ✗'}\n")
+    raise SystemExit(1 if failures else 0)

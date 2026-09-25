@@ -19,3 +19,5 @@ __pycache__/
 *.suo
 *.ntvs*
 *.njsproj
+# Virtualenv yang dibuat VS Code
+.venv/

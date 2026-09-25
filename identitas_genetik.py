@@ -22,8 +22,10 @@ mob abundances, economy baseline) for that server — forever, on any machine.
 
 DESIGN PRINCIPLES
 -----------------
-• Absolute Determinism    — SHA-256(server_id ‖ created_at) is the sole source
-                            of entropy.  No platform-specific RNG is touched.
+• Absolute Determinism    — The Stage-1 world seed (world_seed.py) is the sole
+                            source of entropy, read through the Stage-2 stream
+                            stream(seed, "genetic", i) (world_stream.py).
+                            No platform-specific RNG is touched.
                             The `random` module is never imported.
 • Entropy Slicing         — The 64-character hex digest is split into 10
                             non-overlapping 6-character windows (each yielding
@@ -62,10 +64,11 @@ ENTROPY SLICE MAP  (SHA-256 hex digest → fields)
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass, field, asdict
 from typing import Dict, FrozenSet, List, Optional, Tuple
+
+from world_stream import DOMAIN_GENETIC, stream, unit, seed_fingerprint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -640,25 +643,25 @@ class ServerGeneticProfile:
     ║  ALL fields prefixed `base_` are genetic immutables.                ║
     ╚══════════════════════════════════════════════════════════════════════╝
 
-    Entropy Slice Map
+    Entropy Slice Map   (slice i = stream(seed, "genetic", i), 256-bit)
     ─────────────────────────────────────────────────────────────────────
-    Slice 0 [ 0: 6]  → dominant_metal_element        (Phase 1 – CWS)
-    Slice 1 [ 6:12]  → dominant_nonmetal_element      (Phase 1 – CWS)
-    Slice 2 [12:18]  → secondary_metal_element        (Phase 1 – CWS)
-    Slice 3 [18:24]  → secondary_nonmetal_element     (Phase 1 – CWS)
-    Slice 4 [24:30]  → world_age                      (Phase 3)
-    Slice 5 [30:36]  → base_world_stability            (Phase 3, mod-adjusted)
-    Slice 6 [36:42]  → base_resource_density           (Phase 3, mod-adjusted)
-    Slice 7 [42:48]  → base_mutation_index             (Phase 3, mod-adjusted)
-    Slice 8 [48:54]  → biome_affinity primary + count  (Phase 3, weight-CWS)
-    Slice 9 [54:60]  → biome_affinity secondary/tertiary (Phase 3, weight-CWS)
+    Slice 0  → dominant_metal_element        (Phase 1 – CWS)
+    Slice 1  → dominant_nonmetal_element      (Phase 1 – CWS)
+    Slice 2  → secondary_metal_element        (Phase 1 – CWS)
+    Slice 3  → secondary_nonmetal_element     (Phase 1 – CWS)
+    Slice 4  → world_age                      (Phase 3)
+    Slice 5  → base_world_stability            (Phase 3, mod-adjusted)
+    Slice 6  → base_resource_density           (Phase 3, mod-adjusted)
+    Slice 7  → base_mutation_index             (Phase 3, mod-adjusted)
+    Slice 8  → biome count (high 128 bit) + primary (low 128 bit)
+    Slice 9  → biome secondary (high 128 bit) + tertiary (low 128 bit)
     ─────────────────────────────────────────────────────────────────────
     """
 
     # ── Identity ──────────────────────────────────────────────────────────
     server_id:          int
-    created_at:         int      # Unix timestamp of server creation
-    genetic_signature:  str      # Full SHA-256 hex digest (64 chars)
+    created_at:         int      # Informational only — does NOT influence the world
+    genetic_signature:  str      # PUBLIC fingerprint of the seed (world_stream.seed_fingerprint)
 
     # ── Phase 1: Dominant Elements ────────────────────────────────────────
     dominant_metal_element:    ElementProfile
@@ -723,13 +726,15 @@ class GeneticEngine:
         entropy slices then clamped after the modifier nudges are applied.
 
     No external state is touched.  No `random` module is used.
-    Every output is purely a function of (server_id, created_at).
+    Every output is purely a function of the Stage-1 world seed.
     """
 
-    # ── Entropy window configuration ──────────────────────────────────────
-    _WINDOW: int    = 6                      # hex chars per slice (24-bit uint)
-    _MAX_UINT: int  = (1 << 24) - 1          # 0xFFFFFF — max value per slice
-    _N_SLICES: int  = 10                     # total slices consumed
+    # ── Entropy configuration ─────────────────────────────────────────────
+    # Slice i = stream(seed, DOMAIN_GENETIC, i).  The stream is unbounded;
+    # new fields take new indices >= _N_SLICES and never shift existing ones.
+    _N_SLICES: int  = 10
+    _HALF_BITS: int = 128                    # biome slices are split in two halves
+    _HALF_MASK: int = (1 << 128) - 1
 
     # ── Slice index constants ─────────────────────────────────────────────
     _S_DOM_METAL    = 0
@@ -772,25 +777,26 @@ class GeneticEngine:
     def generate_profile(
         self,
         server_id:  int,
-        created_at: int,
+        seed:       bytes,
+        created_at: int = 0,
     ) -> ServerGeneticProfile:
         """
-        Derive an immutable ServerGeneticProfile from *server_id* and
-        *created_at* using the three-phase cascade pipeline.
+        Derive an immutable ServerGeneticProfile from the Stage-1 *seed*
+        using the three-phase cascade pipeline.
 
         Parameters
         ----------
-        server_id  : Discord snowflake ID (positive integer).
-        created_at : Unix epoch timestamp of server creation (integer).
+        server_id  : Discord snowflake ID (identity only; not an entropy input —
+                     it already sits inside the seed pre-image).
+        seed       : 32-byte Stage-1 world seed (world_seed.derive_seed).
+        created_at : Informational Unix timestamp; does NOT affect the world.
 
         Returns
         -------
         ServerGeneticProfile — fully deterministic, frozen, cross-platform.
         """
-        # ── Hash & slice ──────────────────────────────────────────────────
-        seed_str   = f"{server_id}:{created_at}"
-        digest_hex = hashlib.sha256(seed_str.encode("utf-8")).hexdigest()
-        slices     = self._extract_slices(digest_hex)
+        # ── Stage-2 stream slices ─────────────────────────────────────────
+        slices = [stream(seed, DOMAIN_GENETIC, i) for i in range(self._N_SLICES)]
 
         # ═════════════════════════════════════════════════════════════════
         # PHASE 1 — ELEMENT SELECTION (Cumulative Weight Search)
@@ -871,7 +877,7 @@ class GeneticEngine:
         return ServerGeneticProfile(
             server_id=server_id,
             created_at=created_at,
-            genetic_signature=digest_hex,
+            genetic_signature=seed_fingerprint(seed),
             dominant_metal_element=_element_to_profile(dom_metal),
             secondary_metal_element=_element_to_profile(sec_metal),
             dominant_nonmetal_element=_element_to_profile(dom_nonmetal),
@@ -922,26 +928,10 @@ class GeneticEngine:
     # PRIVATE — Entropy extraction
     # ─────────────────────────────────────────────────────────────────────
 
-    def _extract_slices(self, digest_hex: str) -> List[str]:
-        """
-        Partition the 64-char digest into 10 non-overlapping 6-char windows.
-        Chars [60:64] are reserved salt — not consumed in current generation.
-        Returns a list of exactly 10 hex strings.
-        """
-        w = self._WINDOW
-        return [digest_hex[i * w : (i + 1) * w] for i in range(self._N_SLICES)]
-
     @staticmethod
-    def _hex_to_uint(hex_slice: str) -> int:
-        """Convert a hex slice of any length to an unsigned integer."""
-        return int(hex_slice, 16)
-
-    def _to_unit(self, hex_slice: str) -> float:
-        """
-        Map a hex slice onto [0.0, 1.0] with maximum precision.
-        Formula: uint(slice) / _MAX_UINT
-        """
-        return self._hex_to_uint(hex_slice) / self._MAX_UINT
+    def _to_unit(h: int) -> float:
+        """Map a stream value onto [0.0, 1.0) — world_stream.unit (53-bit)."""
+        return unit(h)
 
     # ─────────────────────────────────────────────────────────────────────
     # PRIVATE — Cumulative Weight Search (CWS) engine
@@ -971,14 +961,14 @@ class GeneticEngine:
 
     def _cws_element(
         self,
-        hex_slice: str,
+        h: int,
         cum_table: Tuple[Tuple[int, Element], ...],
         exclude_symbol: Optional[str] = None,
     ) -> Element:
         """
         Deterministic Cumulative Weight Search.
 
-        Maps the uint value of *hex_slice* onto the total weight range of
+        Maps the stream value *h* onto the total weight range of
         *cum_table*, then performs a linear scan to find the element whose
         cumulative ceiling first exceeds the mapped target.
 
@@ -988,7 +978,7 @@ class GeneticEngine:
 
         Parameters
         ----------
-        hex_slice       : 6-character hex string (24-bit entropy).
+        h               : Stream value (256-bit; modulo bias <= total/2**256).
         cum_table       : Pre-computed cumulative weight table.
         exclude_symbol  : Symbol of an element to skip (for secondary picks).
 
@@ -997,9 +987,8 @@ class GeneticEngine:
         Element — exactly one element, deterministically selected.
         """
         total_weight = cum_table[-1][0]
-        # Map the raw uint to [0, total_weight - 1]
-        raw_uint = self._hex_to_uint(hex_slice)
-        target   = raw_uint % total_weight   # bounded, deterministic
+        # Map the stream value to [0, total_weight - 1]
+        target   = h % total_weight          # bounded, deterministic
 
         # Linear CWS scan
         selected: Optional[Element] = None
@@ -1027,13 +1016,13 @@ class GeneticEngine:
     # PRIVATE — World Age
     # ─────────────────────────────────────────────────────────────────────
 
-    def _derive_world_age(self, hex_slice: str) -> str:
+    def _derive_world_age(self, h: int) -> str:
         """
         Map the slice to one of the three world age tiers.
         Tiers are equally spaced across the [0.0, 1.0] unit interval.
         """
-        unit = self._to_unit(hex_slice)
-        idx  = min(int(unit * len(_WORLD_AGE_TIERS)), len(_WORLD_AGE_TIERS) - 1)
+        u    = self._to_unit(h)
+        idx  = min(int(u * len(_WORLD_AGE_TIERS)), len(_WORLD_AGE_TIERS) - 1)
         return _WORLD_AGE_TIERS[idx]
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1058,7 +1047,7 @@ class GeneticEngine:
 
     def _cws_biome(
         self,
-        hex_slice:   str,
+        h:           int,
         cum_table:   Tuple[Tuple[int, str], ...],
         exclude_set: FrozenSet[str],
     ) -> str:
@@ -1071,8 +1060,7 @@ class GeneticEngine:
         terminates.
         """
         total_weight = cum_table[-1][0]
-        raw_uint     = self._hex_to_uint(hex_slice)
-        target       = raw_uint % total_weight
+        target       = h % total_weight
 
         start_idx: int = 0
         for i, (ceiling, _) in enumerate(cum_table):
@@ -1093,26 +1081,26 @@ class GeneticEngine:
 
     def _derive_biomes(
         self,
-        slice_a:    str,
-        slice_b:    str,
+        slice_a:    int,
+        slice_b:    int,
         cum_table:  Tuple[Tuple[int, str], ...],
     ) -> List[str]:
         """
         Derive 1–3 unique biome tags using the modifier-weighted CWS table.
 
-        Slice A — first 3 chars drive count {1,2,3}; last 3 drive primary.
-        Slice B — first 3 chars drive secondary;   last 3 drive tertiary.
+        Slice A — high 128 bits drive count {1,2,3}; low 128 bits drive primary.
+        Slice B — high 128 bits drive secondary;     low 128 bits drive tertiary.
 
         Uniqueness is enforced by passing an exclude_set to each subsequent
         CWS call, so no biome can appear twice regardless of weight shape.
         """
-        # Sub-slice each 6-char slice into two 3-char halves
-        a_count   = slice_a[0:3]   # biome count
-        a_primary = slice_a[3:6]   # primary biome
-        b_second  = slice_b[0:3]   # secondary biome
-        b_third   = slice_b[3:6]   # tertiary biome
+        # Split each 256-bit slice into two independent 128-bit halves
+        a_count   = slice_a >> self._HALF_BITS    # biome count
+        a_primary = slice_a &  self._HALF_MASK    # primary biome
+        b_second  = slice_b >> self._HALF_BITS    # secondary biome
+        b_third   = slice_b &  self._HALF_MASK    # tertiary biome
 
-        n_biomes = (self._hex_to_uint(a_count) % 3) + 1   # → {1, 2, 3}
+        n_biomes = (a_count % 3) + 1                      # → {1, 2, 3}
 
         primary   = self._cws_biome(a_primary, cum_table, frozenset())
         biomes    = [primary]
@@ -1237,6 +1225,7 @@ def _print_profile(profile: ServerGeneticProfile, label: str) -> None:
 
 
 if __name__ == "__main__":
+    from world_stream import test_seed
     engine = GeneticEngine()
 
     # ── Test vectors — outputs MUST be identical on every machine ─────────
@@ -1265,7 +1254,7 @@ if __name__ == "__main__":
     profiles: List[ServerGeneticProfile] = []
     for entry in TEST_SERVERS:
         label, sid, cat = entry
-        profile = engine.generate_profile(server_id=sid, created_at=cat)
+        profile = engine.generate_profile(server_id=sid, seed=test_seed(f"{sid}:{cat}"), created_at=cat)
         profiles.append(profile)
         _print_profile(profile, label)
         print()
@@ -1279,8 +1268,8 @@ if __name__ == "__main__":
     all_pass = True
     for entry in TEST_SERVERS:
         label, sid, cat = entry
-        p1 = engine.generate_profile(sid, cat)
-        p2 = engine.generate_profile(sid, cat)
+        p1 = engine.generate_profile(sid, test_seed(f"{sid}:{cat}"), cat)
+        p2 = engine.generate_profile(sid, test_seed(f"{sid}:{cat}"), cat)
         checks = [
             p1.genetic_signature        == p2.genetic_signature,
             p1.dominant_metal_element   == p2.dominant_metal_element,

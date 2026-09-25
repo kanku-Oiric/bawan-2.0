@@ -658,6 +658,7 @@ def _print_crystal_item(item: CrystalItem, label: str = "") -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from world_stream import test_seed
 
     print()
     print(f"  ╔{'═' * 70}╗")
@@ -679,12 +680,9 @@ if __name__ == "__main__":
     factory   = CrystalFactory()
     miner     = MiningEngine()
 
-    profile  = g_engine.generate_profile(
-        server_id  = 100000000000000001,
-        created_at = 1577836800,
-    )
-    catalog  = m_engine.generate_geology(profile)
-    state    = spawner.initialise(profile, catalog)
+    profile  = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800)
+    catalog  = m_engine.generate_geology(profile, test_seed(f"{profile.server_id}:{profile.created_at}"))
+    state    = spawner.initialise(profile, catalog, test_seed(f"{profile.server_id}:{profile.created_at}"))
 
     # Pick the first crystal node available in the spawn state.
     if not state.active_crystals:

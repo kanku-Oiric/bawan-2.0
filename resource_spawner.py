@@ -41,6 +41,8 @@
 from __future__ import annotations
 
 import hashlib
+
+from world_stream import DOMAIN_SPAWNER, DomainStream
 import json
 import sys
 import os
@@ -62,7 +64,6 @@ from material_gen import (
 # SECTION 1 — CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SPAWNER_SALT: bytes = b"spawner_salt"
 
 # Depth-layer access classification keys (used by Discord bot channel router).
 ACCESS_PUBLIC:     str = "Public Access"
@@ -106,53 +107,26 @@ _VEIN_WEIGHT_RANGE:  int = 0xFFFFFF  # 16,777,215  (24-bit max)
 
 class _SpawnerEntropy:
     """
-    Deterministic entropy source for the spawner, seeded from the genetic
-    signature via SHA-256(genetic_signature.encode() + b"spawner_salt").
-
-    Uses 6-char (24-bit) hex windows for higher resolution than material_gen's
-    4-char windows, giving finer vein-weight granularity.  Overflow is handled
-    identically to material_gen._EntropyStream (extension counter chaining).
+    Sequential view over the Stage-2 stream  stream(seed, "spawner", i).
+    Every draw consumes exactly one index; independent of all other domains.
 
     This class is PRIVATE to this module.  Downstream consumers MUST NOT
     access it directly — all deterministic values must be requested through
     ResourceSpawner public methods.
     """
 
-    _WINDOW: int            = 6           # hex chars per window (24-bit uint)
-    _MAX_U24: int           = 0xFFFFFF    # 16_777_215
-    _WINDOWS_PER_BLOCK: int = 10          # 60 / 6 = 10 full windows per 64-char hash
-    #  Note: 64 chars / 6 chars = 10 windows + 4 residual chars (ignored, same as
-    #        the identitas_genetik salt residual convention).
-
-    def __init__(self, genetic_signature: str) -> None:
-        self._primary: str = hashlib.sha256(
-            genetic_signature.encode("utf-8") + _SPAWNER_SALT
-        ).hexdigest()
-        self._extension_counter: int = 0
-        self._cursor: int            = 0    # window index within current block
-        self._current_block: str     = self._primary
+    def __init__(self, seed: bytes) -> None:
+        self._stream = DomainStream(seed, DOMAIN_SPAWNER)
 
     # ── Core stream consumption ───────────────────────────────────────────────
 
     def next_uint24(self) -> int:
-        """Consume the next 24-bit unsigned integer from the entropy stream."""
-        if self._cursor >= self._WINDOWS_PER_BLOCK:
-            self._extension_counter += 1
-            ext = hashlib.sha256(
-                self._primary.encode("utf-8")
-                + self._extension_counter.to_bytes(2, "big")
-            ).hexdigest()
-            self._current_block = ext
-            self._cursor        = 0
-
-        start  = self._cursor * self._WINDOW
-        window = self._current_block[start : start + self._WINDOW]
-        self._cursor += 1
-        return int(window, 16)
+        """Top 24 bits of the next stream value."""
+        return self._stream.next_int() >> 232
 
     def next_unit(self) -> float:
-        """Return a float uniformly distributed in [0.0, 1.0]."""
-        return self.next_uint24() / self._MAX_U24
+        """Return a float uniformly distributed in [0.0, 1.0) (53-bit)."""
+        return self._stream.next_unit()
 
     def next_in_range(self, lo: float, hi: float) -> float:
         """Return a float in [lo, hi]."""
@@ -401,7 +375,7 @@ class ResourceSpawner:
 
     Usage:
         spawner = ResourceSpawner()
-        state   = spawner.initialise(profile, catalog)
+        state   = spawner.initialise(profile, catalog, seed)
 
         # Later — mining action:
         extracted = spawner.extract_resource(state, node_id, amount=50.0)
@@ -422,6 +396,7 @@ class ResourceSpawner:
         self,
         profile: ServerGeneticProfile,
         catalog: ServerMaterialCatalog,
+        seed:    bytes,
     ) -> ServerSpawnState:
         """
         Build the complete ServerSpawnState from a frozen profile + catalog pair.
@@ -432,7 +407,7 @@ class ResourceSpawner:
 
         Returns a fully populated ServerSpawnState ready for runtime use.
         """
-        entropy = _SpawnerEntropy(profile.genetic_signature)
+        entropy = _SpawnerEntropy(seed)   # stream(seed, "spawner", i)
 
         active_ores:     Dict[str, ActiveOreNode]     = {}
         active_crystals: Dict[str, ActiveCrystalNode] = {}
@@ -772,14 +747,15 @@ def _build_mock_catalog(
     if not use_live_engine:
         raise NotImplementedError("Manual mock injection not implemented in this build.")
 
+    from world_stream import test_seed
+
     g_engine  = GeneticEngine()
     m_engine  = MaterialEngine()
 
-    profile   = g_engine.generate_profile(
-        server_id  = server_id,
-        created_at = 1577836800,   # Neon Spire — 2020-01-01 00:00 UTC
-    )
-    catalog   = m_engine.generate_geology(profile)
+    created_at = 1577836800   # Neon Spire — 2020-01-01 00:00 UTC (label only)
+    seed      = test_seed(f"{server_id}:{created_at}")
+    profile   = g_engine.generate_profile(server_id=server_id, seed=seed, created_at=created_at)
+    catalog   = m_engine.generate_geology(profile, seed)
     return profile, catalog
 
 
@@ -788,6 +764,7 @@ def _build_mock_catalog(
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from world_stream import test_seed
 
     print()
     print(f"  {'╔' + '═' * 74 + '╗'}")
@@ -811,15 +788,15 @@ if __name__ == "__main__":
     spawner  = ResourceSpawner()
 
     # ── Server A: Neon Spire — moderate tectonic, balanced world ─────────────
-    profile_a = g_engine.generate_profile(server_id=100000000000000001, created_at=1577836800)
-    catalog_a = m_engine.generate_geology(profile_a)
+    profile_a = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800)
+    catalog_a = m_engine.generate_geology(profile_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
 
     # ── Server B: Iron Veil — high-pressure, ancient, stable world ───────────
     import hashlib as _hl
     iron_sig = _hl.sha256(b"iron_world_scenario_v1").hexdigest()
     # Build via a simplified helper that exercises live engine path
-    profile_b = g_engine.generate_profile(server_id=987654321098765432, created_at=1609459200)
-    catalog_b = m_engine.generate_geology(profile_b)
+    profile_b = g_engine.generate_profile(server_id=987654321098765432, seed=test_seed(f"{987654321098765432}:{1609459200}"), created_at=1609459200)
+    catalog_b = m_engine.generate_geology(profile_b, test_seed(f"{profile_b.server_id}:{profile_b.created_at}"))
 
     print(f"  ✓ Server A — Neon Spire    (ID: {catalog_a.server_id})")
     print(f"      Tectonic Activity : {catalog_a.tectonic_activity:.6f}")
@@ -843,8 +820,8 @@ if __name__ == "__main__":
     print("  PHASE 1 — SPAWN INITIALISATION")
     print(_DIV_MINOR)
 
-    state_a = spawner.initialise(profile_a, catalog_a)
-    state_b = spawner.initialise(profile_b, catalog_b)
+    state_a = spawner.initialise(profile_a, catalog_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
+    state_b = spawner.initialise(profile_b, catalog_b, test_seed(f"{profile_b.server_id}:{profile_b.created_at}"))
 
     print(f"  ✓ ServerSpawnState created for Neon Spire")
     print(f"      Active Ore Nodes     : {len(state_a.active_ores)}")
@@ -1023,7 +1000,7 @@ if __name__ == "__main__":
     print("  PHASE 6 — IDEMPOTENCY PROOF  (Determinism Verification)")
     print(_DIV_MINOR)
 
-    state_a2 = spawner.initialise(profile_a, catalog_a)
+    state_a2 = spawner.initialise(profile_a, catalog_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
 
     all_pass = True
     # Compare every ore node ID and initial max_reserve

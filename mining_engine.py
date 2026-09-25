@@ -1037,6 +1037,7 @@ def _print_result(result: MiningResult, node_reserve_after: float,
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from world_stream import test_seed
 
     print()
     print(f"  {'╔' + '═' * 74 + '╗'}")
@@ -1058,9 +1059,9 @@ if __name__ == "__main__":
     miner    = MiningEngine()
 
     # ── Server A: Neon Spire (moderate tectonic, crystal-bearing) ─────────────
-    profile_a = g_engine.generate_profile(server_id=100000000000000001, created_at=1577836800)
-    catalog_a = m_engine.generate_geology(profile_a)
-    state_a   = spawner.initialise(profile_a, catalog_a)
+    profile_a = g_engine.generate_profile(server_id=100000000000000001, seed=test_seed(f"{100000000000000001}:{1577836800}"), created_at=1577836800)
+    catalog_a = m_engine.generate_geology(profile_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
+    state_a   = spawner.initialise(profile_a, catalog_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
 
     # ── Build a synthetic high-pressure Uranium ABYSS world for scenario tests ─
     # We re-use material_gen's _build_mock_profile pattern inline.
@@ -1089,8 +1090,8 @@ if __name__ == "__main__":
         biome_affinity             = ("IRRADIATED_WASTES", "NETHER_DEPTHS", "ABYSSAL_TRENCH"),
         world_flavour_tags         = (),
     )
-    uranium_catalog = m_engine.generate_geology(uranium_profile)
-    uranium_state   = spawner.initialise(uranium_profile, uranium_catalog)
+    uranium_catalog = m_engine.generate_geology(uranium_profile, test_seed(f"{uranium_profile.server_id}:{uranium_profile.created_at}"))
+    uranium_state   = spawner.initialise(uranium_profile, uranium_catalog, test_seed(f"{uranium_profile.server_id}:{uranium_profile.created_at}"))
 
     print(f"  ✓ Neon Spire     — tectonic={catalog_a.tectonic_activity:.4f}  "
           f"pressure={catalog_a.pressure_index:.4f}")
@@ -1342,7 +1343,7 @@ if __name__ == "__main__":
 
     print(f"  Target Node   : {abyss_node_id}")
     print(f"  Node Hardness : {reso_hardness:.1f}  |  Resonator Power: {resonator.power:.1f}")
-    print(f"  Power Factor  : {reso_power_fac:.4f}  ({"full efficiency ✓" if reso_power_fac == 1.0 else "penalised"})")
+    print(f"  Power Factor  : {reso_power_fac:.4f}  ({'full efficiency ✓' if reso_power_fac == 1.0 else 'penalised'})")
     print(f"  Stamina Cost  : {reso_stamina_req:.2f} per swing")
     print()
     print(f"  Current node reserve after Scenario A mining:")
@@ -1379,7 +1380,7 @@ if __name__ == "__main__":
     print(_DIV_MINOR)
 
     # Fresh spawn for a clean depletion test
-    fresh_state = spawner.initialise(profile_a, catalog_a)
+    fresh_state = spawner.initialise(profile_a, catalog_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
     test_node_id = next(iter(fresh_state.active_ores))
     test_node    = fresh_state.active_ores[test_node_id]
 
@@ -1389,7 +1390,7 @@ if __name__ == "__main__":
 
     for pk_key, pk in [("copper_starter", PICKAXES["copper_starter"]),
                         ("titanium_drill", PICKAXES["titanium_drill"])]:
-        fresh_sub   = spawner.initialise(profile_a, catalog_a)
+        fresh_sub   = spawner.initialise(profile_a, catalog_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
         sub_nid     = next(iter(fresh_sub.active_ores))
         sub_node    = fresh_sub.active_ores[sub_nid]
         sub_miner   = MiningEngine()
@@ -1418,8 +1419,8 @@ if __name__ == "__main__":
     print(_DIV_MINOR)
 
     # Build two fresh identical states and mine the same node with same stamina
-    det_state1  = spawner.initialise(profile_a, catalog_a)
-    det_state2  = spawner.initialise(profile_a, catalog_a)
+    det_state1  = spawner.initialise(profile_a, catalog_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
+    det_state2  = spawner.initialise(profile_a, catalog_a, test_seed(f"{profile_a.server_id}:{profile_a.created_at}"))
     det_node_id = next(iter(det_state1.active_ores))
 
     miner1 = MiningEngine()
