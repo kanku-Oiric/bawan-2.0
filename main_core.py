@@ -1394,6 +1394,9 @@ async def sell_crystal(interaction: discord.Interaction, crystal_name: str) -> N
     await interaction.followup.send(embed=em, ephemeral=True)
 
 @bot.tree.command(name="found_currency", description="[ADMIN ONLY] Terbitkan mata uang fiat resmi server ini!")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)     # hidden from non-admins in the UI
+@app_commands.checks.has_permissions(administrator=True)  # enforced server-side, whatever the UI says
 @app_commands.describe(
     currency_name="Nama mata uang (misal: Amerta Dollar)",
     ticker="Kode ticker 2-5 huruf (misal: AMD)"
@@ -1458,6 +1461,9 @@ async def found_currency(interaction: discord.Interaction, currency_name: str, t
         await interaction.followup.send(f"❌ **GENESIS FAILED**\n{str(e)}", ephemeral=True)
 
 @bot.tree.command(name="mint_fiat", description="[ADMIN ONLY] Cetak uang fiat lokal tambahan (Quantitative Easing)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(amount="Jumlah uang yang mau dicetak (misal: 50000)")
 async def mint_fiat(interaction: discord.Interaction, amount: float) -> None:
     await interaction.response.defer(ephemeral=False) # Biar se-server liat inflasi nambah wkwk
@@ -1521,6 +1527,23 @@ async def mint_fiat(interaction: discord.Interaction, amount: float) -> None:
     em.set_footer(text=report.reason)
 
     await interaction.followup.send(embed=em)
+
+
+async def _admin_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    # A local handler suppresses the tree's default logging, so log here.
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "⛔ Command ini khusus admin server."
+    else:
+        log.error("Error in /%s", interaction.command.name if interaction.command else "?", exc_info=error)
+        msg = "❌ Terjadi error. Cek log bot."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+found_currency.error(_admin_command_error)
+mint_fiat.error(_admin_command_error)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 9 — VOICE ACTIVITY TRACKER
