@@ -16,6 +16,7 @@ Bot Discord ekonomi MMORPG per-server. Dunia tiap server (unsur, ore, crystal, m
 | 0 — registrasi | `world_nonce` = randomness ronde **drand quicknet** pertama setelah `registered_at` | Tidak ada: rondenya di masa depan saat registrasi |
 | 1 — seed | `seed = HMAC-SHA256(pepper, "BAWAN\|{algo_version}\|{guild_id}\|{world_nonce}")` | Tidak ada: pepper terkunci oleh commitment di bawah |
 | 2 — stream | `stream(seed, domain, i) = HMAC-SHA256(seed, "{domain}\|{i}")`, `unit(h) = (h >> 203) / 2**53`; domain: `genetic`, `material`, `spawner`, `periodic` (+ cadangan `wood`, `flora`, `mob`, `season`) | Tidak ada: deterministik dari seed; tiap domain independen |
+| roll mining | `roll = HMAC-SHA256(seed, "mining\|{guild_id}\|{user_id}\|{node_id}\|{n}")`, `n` = counter percobaan (guild, user) yang dinaikkan atomik di DB **sebelum** roll dihitung | Pemain: tidak ada (counter tidak bisa dimundurkan/dihapus). Operator: lihat *Known limitations* |
 
 Setiap registrasi dan aktivasi dipublikasikan ke webhook saksi publik. `/worldproof` di server mana pun menampilkan semua bahan verifikasi.
 
@@ -33,3 +34,19 @@ Cara mendapatkan nilainya: `python world_seed.py --commitment`. Nilai yang sama 
 
 1. `SHA-256(bytes.fromhex(pepper)) == commitment` di tabel atas.
 2. Untuk tiap server di `/worldproof`: cek `world_nonce` di relay drand, lalu hitung ulang `seed` dengan rumus Stage 1.
+
+## Known limitations
+
+### Operator bisa memprediksi roll mining
+
+Pemegang pepper (operator) bisa menghitung `seed` server mana pun, dan counter `n` tersimpan di DB yang ia kelola. Artinya ia bisa menghitung **hasil ayunan berikutnya** setiap pemain di setiap node sebelum ayunan itu terjadi, lalu memakai informasi itu (memilih node/waktu untuk akunnya sendiri, atau membocorkannya ke pemain tertentu).
+
+Yang **tidak** bisa ia lakukan: mengubah hasil percobaan yang sudah terjadi (roll tetap bisa dihitung ulang siapa pun setelah pepper dibuka) atau mengulang nomor percobaan (counter hanya bisa naik). Pemain biasa tidak bisa memprediksi roll karena tidak tahu pepper.
+
+**Rencana mitigasi (BELUM aktif):** masukkan randomness drand ke pre-image roll:
+
+```
+roll = HMAC-SHA256(seed, "mining|{guild_id}|{user_id}|{node_id}|{n}|{drand_round}|{drand_randomness}")
+```
+
+dengan `drand_round` = ronde pertama **setelah** counter `n` dinaikkan (waktu dari jam DB), dan ronde + signature-nya disimpan per percobaan supaya bisa diaudit. Karena ronde itu belum ada saat `n` dikunci, operator pun tidak bisa tahu hasilnya lebih dulu. Konsekuensi yang harus diterima kalau ini diaktifkan: tiap ayunan menunggu ±3 detik (periode quicknet), dan kalau drand tidak bisa dihubungi ayunan ditolak (tanpa fallback, sama seperti Stage 0).
