@@ -28,23 +28,40 @@ Rutin harian:
 
 Exit code 1 kalau `ledger_audit()` tidak bersih saat backup — jadikan itu alarm.
 
-Restore (ke project kosong): jalankan `supabase/schema.sql`, lalu dari `psql` (connection string di Supabase → Settings → Database) `\copy public.<tabel> (<kolom sesuai header CSV>) from '<tabel>.csv' with (format csv, header true)` dengan urutan: `server_registry`, `world_nonces`, `world_commitments`, `world_witness_log`, `currencies`, `voice_config`, `mining_attempts`, `players`, `items`, `ledger`, `item_disposals`, `mining_results`, `voice_ticks`. Sebelum `players`, jalankan `select set_config('bawan.ledger', 'on', false);` di sesi yang sama (trigger wallet menolak saldo ≠ 0 tanpa itu). Sesudahnya: `select setval('public.ledger_id_seq', (select max(id) from public.ledger));`, samakan `production_policy` dengan CSV lewat UPDATE, lalu pastikan `select public.ledger_audit();` bersih.
+Restore (ke project kosong): jalankan `supabase/schema.sql`, lalu dari `psql` (connection string di Supabase → Settings → Database) `\copy public.<tabel> (<kolom sesuai header CSV>) from '<tabel>.csv' with (format csv, header true)` dengan urutan: `server_registry`, `world_nonces`, `world_commitments`, `world_witness_log`, `currencies`, `voice_config`, `mining_attempts`, `players`, `items`, `ledger`, `item_disposals`, `mining_results`, `voice_ticks`, `node_state`. Sebelum `players`, jalankan `select set_config('bawan.ledger', 'on', false);` di sesi yang sama (trigger wallet menolak saldo ≠ 0 tanpa itu); `node_state` cukup di-INSERT (trigger-nya hanya menjaga UPDATE/DELETE). Sesudahnya: `select setval('public.ledger_id_seq', (select max(id) from public.ledger));`, samakan `production_policy` dengan CSV lewat UPDATE, lalu pastikan `select public.ledger_audit();` bersih.
 
-## Saldo & ledger (schema v7)
+## Saldo & ledger (schema v7–v8)
 
 Database adalah satu-satunya sumber kebenaran. Setiap perubahan pemain = **satu fungsi = satu transaksi Postgres**, dan setiap perubahan saldo meninggalkan satu baris di `ledger` (insert-only). Bot tidak punya flush berkala; memori hanya salinan baca yang diisi dari hasil fungsi.
 
 | Aksi | Fungsi DB | Jaminan |
 |---|---|---|
-| Ayunan (manual & auto) | `begin_swing` → roll → `record_swing` | n naik atomik sebelum roll; hasil tercatat sekali per n di `mining_results`; stamina dicek di DB |
+| Ayunan (manual & auto) | `begin_swing` → roll → `record_swing` | batas ayunan/menit & stamina dicek sebelum n naik; hasil, stamina, cadangan node, dan barang tercatat sekali per n dalam satu transaksi |
 | `/sell_ore`, `/sell_crystal` | `sell_item` | barang terkunci; `item_disposals` (PK) → satu barang hanya bisa dijual sekali |
 | Reward voice | `apply_voice_tick` | satu tick = satu transaksi; `ref` tetap → retry setelah timeout tidak dobel |
-| `/rest`, pickaxe, auto mine | `rest_player`, `set_player_prefs` | bukan uang, tanpa ledger |
+| Pickaxe, auto mine | `set_player_prefs` | bukan uang, tanpa ledger |
+| Cadangan node | `register_nodes` | node didaftarkan sekali (parameter dikunci); cadangan hanya berkurang di `record_swing` |
 
 - `players.wallet` bertipe `numeric(24,4)` dan hanya bisa berubah dari dalam fungsi ledger — trigger menolak UPDATE/INSERT langsung, termasuk dengan key service_role. Baris pemain tidak bisa dihapus.
 - Uang beredar M = jumlah saldo di DB (`money_supply`), satu sumber.
 - Helper internal ada di skema `bawan_private` yang tidak diekspos PostgREST, jadi tidak bisa dipanggil lewat REST.
 - Stamina dan batas ayunan dibaca dari tabel `production_policy`; angkanya bisa diganti tanpa mengubah skema.
+
+### Batas produksi (schema v8)
+
+Tidak ada `/rest`. Stamina dan cadangan node pulih **dari waktu, menurut jam database**:
+
+- stamina = min(cap, stamina tersimpan + laju × Δt); cadangan node = min(max, cadangan + regen × Δt)
+- `begin_swing` menolak (sebelum nomor percobaan terpakai) kalau stamina < biaya ayunan node atau batas ayunan per menit tercapai
+- cadangan node hanya bisa berkurang, hanya di dalam `record_swing`; restart bot tidak lagi mengisi ulang node
+
+| Parameter | Nilai awal | Ubah dengan |
+|---|---|---|
+| `stamina_cap` | 100 | `update production_policy set … where scope = 'global'` |
+| `stamina_regen_per_second` | 50/jam (penuh dari 0 dalam 2 jam) | idem |
+| `max_swings_per_minute` | 6 | idem |
+
+Produksi maksimum satu pemain per hari dengan angka ini: stamina 100 + 50 × 24 = **1.300/hari**. Biaya ayunan 10 (SURFACE/SHALLOW) sampai 20 (DEEP/ABYSS di pressure 1), jadi **65–130 ayunan/hari**; batas 6/menit tidak mengikat harian (8.640), hanya burst. Tonase per hari tergantung dunia dan pickaxe (simulasi 200 dunia, node terbaik): median **≈790 t** dengan `copper_starter`, **≈56.000 t** dengan `abyss_resonator` — lihat *Known limitations*.
 - `ledger_audit()` memeriksa wallet = Σ ledger, rantai `balance_after`, dan penjualan tanpa pelepasan.
 - `/mint_fiat` dinonaktifkan sampai ada desain kebijakan moneter.
 
@@ -112,9 +129,9 @@ dengan `drand_round` = ronde pertama **setelah** counter `n` dinaikkan (waktu da
 
 Jumlah payout (`/sell_ore`, reward voice) dihitung oleh bot, lalu database mencatatnya. Siapa pun yang memegang key service_role bisa memanggil `sell_item` / `apply_voice_tick` dengan jumlah berapa pun. Ledger tidak mencegah ini. Yang dijamin ledger: setiap unit uang punya baris dengan `kind`, `ref`, dan waktu, rantai saldo tidak bisa diputus, dan tidak ada baris yang bisa diubah atau dihapus tanpa menghapus trigger dulu.
 
-### Cadangan node masih di memori
+### Pickaxe bebas dipilih
 
-Pengurangan cadangan node saat nambang belum disimpan ke database, jadi restart mengembalikan node ke penuh. Ini dikerjakan di langkah berikutnya (persist cadangan node + batas produksi), sebelum LANGKAH 5.
+Menu alat menawarkan keempat pickaxe ke semua pemain tanpa syarat. Yield per ayunan `abyss_resonator` ≈80× `copper_starter` (median 530 t vs 6,5 t), jadi produksi harian lebih ditentukan pilihan pickaxe daripada stamina, dan dengan pickaxe terbaik satu pemain bisa melampaui regen harian node terbaik di 80–95% dunia. Batas produksi di atas membatasi jumlah ayunan, bukan ini. Rencana: akses pickaxe lewat kepemilikan (dibeli/di-craft) di desain sink.
 
 ## Dokumen desain
 

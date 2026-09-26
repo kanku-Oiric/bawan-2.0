@@ -26,15 +26,14 @@
 ║  ─────────────────────────────────────────────────────────────────────────  ║
 ║  • No `random` Module    — all game logic flows through deterministic       ║
 ║      engines.  This file contains zero stochastic calls.                   ║
-║  • Write-Through Cache   — players, currencies and voice config are        ║
-║      loaded from Supabase at startup and cached in the global dicts.       ║
-║      Players are flushed every voice tick and on shutdown; currencies and  ║
-║      voice config are written immediately.  World/spawn state is still     ║
-║      in-memory only (regenerated deterministically from server DNA).       ║
+║  • DB First (schema v7/v8) — every player change is one Supabase RPC      ║
+║      (one transaction; money also leaves an insert-only ledger row).      ║
+║      Memory is a read cache filled from RPC results; no flush.  Node      ║
+║      reserves live in node_state, regen computed from the DB clock.       ║
 ║  • Persistent View IDs   — every UI component uses a stable custom_id     ║
 ║      format so callback resolution survives bot restarts cleanly.          ║
 ║  • Lean Component Budget — one Select for nodes, one Select for tools,     ║
-║      one rest button.  Never approaches the 25-component API limit.        ║
+║      no rest button: stamina recovers over time.  Well under 25.          ║
 ║  • Single Interaction Per Node  — downstream extractions are committed     ║
 ║      in one atomic sequence: select node → select tool → execute.         ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
@@ -103,6 +102,7 @@ from resource_spawner import (
     ActiveOreNode,
     ActiveCrystalNode,
     ACCESS_RESTRICTED,
+    regeneration_per_tick,
 )
 from mining_engine import MiningEngine, MiningResult, Pickaxe, PICKAXES
 from ore import OreFactory, OreItem
@@ -128,7 +128,7 @@ from voice_engine import (
 )
 from db_ekonomi_pusat import EconomyDatabase, LedgerRejected, normalize_supabase_url
 from automine_engine import AutoSwing, plan_swing, choose_best_node, node_label
-from mining_swing import SwingOutcome, execute_swing
+from mining_swing import SwingOutcome, execute_swing, swing_stamina_cost
 from world_registry import (
     WorldRegistry,
     WorldRecord,
@@ -136,6 +136,7 @@ from world_registry import (
     BeaconUnavailable,
     BeaconNotYet,
     STATUS_ACTIVE,
+    parse_timestamptz,
 )
 from world_seed import SeedService, load_peppers, reconcile_commitments, PepperError
 from worldgen import WORLDGEN_VERSION_CURRENT, generate_world
@@ -226,8 +227,13 @@ _GLOBAL_WORLD_RECORDS: Dict[int, WorldRecord]              = {}   # Stage 0 cach
 _WORLD_COMMITMENT_ROWS: List[dict]                         = []   # Stage 1 (published)
 _WITNESS_DELIVERED: Set[str]                               = set()
 
-# Constant for default player stamina.
+# Constant for default player stamina (= production_policy.stamina_cap until the DB says otherwise).
 _DEFAULT_STAMINA: float = 100.0
+
+# production_policy (schema v7/v8), loaded at startup.  The DB enforces it;
+# the bot only uses it to DISPLAY stamina recovering over time.
+_PRODUCTION_POLICY: Dict[str, Any] = {"stamina_cap": _DEFAULT_STAMINA, "stamina_regen_per_second": 0.0,
+                                      "max_swings_per_minute": None}
 
 
 @dataclass
@@ -237,7 +243,8 @@ class PlayerProfile:
     + their held `items`).  Never the source of truth: every field is set from
     an RPC result (or the startup load), never computed and saved from here.
 
-    stamina        : Stamina at the last DB read (0.0 – cap).
+    stamina        : Stamina at the last DB read (0.0 – cap), valid at `stamina_at`;
+                     it recovers over time (see _stamina_now).
     pickaxe_key    : Key into mining_engine.PICKAXES; last-used tool.
     held           : item_id → OreItem | CrystalItem, in acquisition order.
                      item_id is the DB identity ("swing:g:u:n" / "legacy:…").
@@ -247,6 +254,7 @@ class PlayerProfile:
     automine       : Registered for auto mining (/automine daftar).
     """
     stamina:      float            = _DEFAULT_STAMINA
+    stamina_at:   float            = 0.0        # epoch seconds of `stamina` (0 = unknown → no regen shown)
     pickaxe_key:  str              = "copper_starter"
     wallet:       float            = 0.0
     xp:           int              = 0
@@ -265,8 +273,10 @@ class PlayerProfile:
 
     @classmethod
     def from_row(cls, row: dict) -> "PlayerProfile":
+        at = row.get("stamina_at")
         return cls(
             stamina       = float(row["stamina"]),
+            stamina_at    = parse_timestamptz(at).timestamp() if isinstance(at, str) else 0.0,
             pickaxe_key   = row["pickaxe_key"],
             wallet        = float(row["wallet"]),
             xp            = int(row["xp"]),
@@ -274,6 +284,26 @@ class PlayerProfile:
             voice_seconds = float(row["voice_seconds"]),
             automine      = bool(row["automine"]),
         )
+
+
+def _stamina_cap() -> float:
+    return float(_PRODUCTION_POLICY["stamina_cap"])
+
+
+def _stamina_now(player: "PlayerProfile") -> float:
+    """Display value: DB stamina + regen since it was read.  The DB recomputes it for every swing."""
+    regen = float(_PRODUCTION_POLICY["stamina_regen_per_second"])
+    elapsed = max(0.0, time.time() - player.stamina_at) if player.stamina_at else 0.0
+    return min(_stamina_cap(), player.stamina + regen * elapsed)
+
+
+def _set_stamina(player: "PlayerProfile", value: float) -> None:
+    player.stamina, player.stamina_at = value, time.time()
+
+
+def _stamina_bar_text(player: "PlayerProfile", width: int = 10) -> str:
+    now, cap = _stamina_now(player), _stamina_cap()
+    return f"{_reserve_bar(now / cap, width=width)}  **{now:.1f}** / {cap:.0f}"
 
 
 def _item_from_row(row: dict) -> Union[OreItem, CrystalItem]:
@@ -311,30 +341,56 @@ async def _save_prefs(guild_id: int, user_id: int, *, pickaxe_key: Optional[str]
 
 
 _DB_UNAVAILABLE_TEXT: str = "⛔ Database tidak bisa dihubungi. Tidak ada yang berubah — coba lagi sebentar lagi."
-_REST_DISABLED_TEXT: str = "💤 Istirahat instan sedang dinonaktifkan — stamina pulih seiring waktu."
 
 
-async def _handle_rest(interaction: discord.Interaction) -> None:
-    """/rest and the Rest button: stamina = cap, decided by the DB (production_policy)."""
-    guild_id, user_id = interaction.guild_id, interaction.user.id
-    try:
-        before, after = await _run_db(_economy_db.rest_player, guild_id, user_id)
-    except LedgerRejected as exc:
-        text = _REST_DISABLED_TEXT if exc.code == "rest_disabled" else f"⛔ Ditolak database: `{exc.code}`"
-        await interaction.response.send_message(text, ephemeral=True)
+# ── Node reserves (schema v8): the DB holds every node's reserve; regen is ──
+# computed from the DB clock.  The in-memory spawn state is a display/planning
+# copy, refreshed from the DB — a restart never refills a node.
+
+_NODES_SYNCED: Set[int] = set()                # guilds whose nodes are registered in the DB
+_NODE_MISMATCH_WARNED: Set[Tuple[int, str]] = set()
+
+
+def _node_params(state: ServerSpawnState) -> List[dict]:
+    return [{"node_id": nid, "max_reserve": node.max_reserve,
+             "regen_per_second": regeneration_per_tick(node) / TRACKER_TICK_SECONDS}
+            for nid, node in sorted([*state.active_ores.items(), *state.active_crystals.items()])]
+
+
+def _apply_node_reserve(node, reserve: float) -> None:
+    node.current_reserve = round(min(max(0.0, reserve), node.max_reserve), 6)
+    node.is_depleted = node.current_reserve <= 0.0
+
+
+async def _sync_nodes(guild_id: int) -> None:
+    """Register this guild's nodes once (insert-or-ignore), then copy every DB reserve into memory."""
+    state = _GLOBAL_SPAWN_REGISTRY.get(guild_id)
+    if state is None:
         return
-    except Exception:
-        log.exception("rest_player failed guild=%s user=%s", guild_id, user_id)
-        await interaction.response.send_message(_DB_UNAVAILABLE_TEXT, ephemeral=True)
-        return
-    _get_player(guild_id, user_id).stamina = after
-    await interaction.response.send_message(
-        content   = (
-            f"💤  **{interaction.user.display_name}** rested.\n"
-            f"Stamina restored: **{before:.1f}** → **{after:.0f}**"
-        ),
-        ephemeral = True,
-    )
+    first = guild_id not in _NODES_SYNCED
+    rows = await _run_db(_economy_db.register_nodes, guild_id, _node_params(state) if first else [])
+    _NODES_SYNCED.add(guild_id)
+    for row in rows:
+        node = state.active_ores.get(row["node_id"]) or state.active_crystals.get(row["node_id"])
+        if node is None:
+            continue                       # node of an older dev world: kept in the DB, unused here
+        expected = regeneration_per_tick(node) / TRACKER_TICK_SECONDS
+        if (abs(row["max_reserve"] - node.max_reserve) > 1e-6 or abs(row["regen_per_second"] - expected) > 1e-9) \
+                and (guild_id, row["node_id"]) not in _NODE_MISMATCH_WARNED:
+            _NODE_MISMATCH_WARNED.add((guild_id, row["node_id"]))
+            log.warning("Node %s guild=%d: DB params (max %.3f, regen %.6f/s) ≠ worldgen (max %.3f, regen %.6f/s); "
+                        "the DB's reserve is used", row["node_id"], guild_id, row["max_reserve"],
+                        row["regen_per_second"], node.max_reserve, expected)
+        _apply_node_reserve(node, float(row["reserve"]))
+
+
+async def _refresh_nodes() -> None:
+    """Voice tick: copy DB reserves (regen included) into every hydrated world."""
+    for guild_id in list(_GLOBAL_SPAWN_REGISTRY):
+        try:
+            await _sync_nodes(guild_id)
+        except Exception as exc:
+            log.warning("Node refresh guild=%d failed: %s", guild_id, exc)
 
 
 def _get_voice_config(guild_id: int) -> VoiceConfig:
@@ -357,6 +413,7 @@ async def _load_persistent_state() -> None:
     if not _witness.enabled:
         log.warning("WORLD_LOG_WEBHOOK kosong — saksi eksternal nonaktif; event menunggu di antrean sampai diisi.")
 
+    _PRODUCTION_POLICY.update(await _run_db(_economy_db.load_production_policy))
     for row in await _run_db(_economy_db.load_player_rows):
         _GLOBAL_PLAYER_REGISTRY[(int(row["guild_id"]), int(row["user_id"]))] = PlayerProfile.from_row(row)
     held_items = await _run_db(_economy_db.load_held_items)
@@ -638,12 +695,7 @@ def _build_result_embed(
         )
 
     # Player stamina
-    stamina_bar = _reserve_bar(player.stamina / _DEFAULT_STAMINA)
-    em.add_field(
-        name  = "💪  Stamina",
-        value = f"{stamina_bar}  **{player.stamina:.1f}** / {_DEFAULT_STAMINA:.0f}",
-        inline = True,
-    )
+    em.add_field(name="💪  Stamina", value=_stamina_bar_text(player), inline=True)
 
     # attempt (n) + node_id are the public inputs of the roll: after the pepper
     # reveal a player can recompute mining_roll(seed, guild, user, node, n).
@@ -671,8 +723,7 @@ def _tool_select_custom_id(guild_id: int, node_id: str) -> str:
     node_hash = hashlib.sha256(node_id.encode()).hexdigest()[:12]
     return f"tool_select:{guild_id}:{node_hash}"
 
-def _rest_button_custom_id(guild_id: int) -> str:
-    return f"rest:{guild_id}"
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -685,7 +736,7 @@ class NodeSelectView(discord.ui.View):
 
     Contains:
       • A Select menu listing all non-depleted ore and crystal nodes (up to 25).
-      • A /rest button to restore stamina to 100.
+      (No rest button: stamina recovers over time, computed by the DB.)
 
     On node selection → swaps itself out for ToolSelectView on the same message.
     """
@@ -696,7 +747,6 @@ class NodeSelectView(discord.ui.View):
         super().__init__(timeout=None)
         self.guild_id = guild_id
         self._build_node_select()
-        self._build_rest_button()
 
     def _build_node_select(self) -> None:
         state   = _GLOBAL_SPAWN_REGISTRY.get(self.guild_id)
@@ -763,15 +813,6 @@ class NodeSelectView(discord.ui.View):
         select.callback = self._on_node_selected
         self.add_item(select)
 
-    def _build_rest_button(self) -> None:
-        btn = discord.ui.Button(
-            label     = "💤  Rest (restore stamina)",
-            style     = discord.ButtonStyle.secondary,
-            custom_id = _rest_button_custom_id(self.guild_id),
-        )
-        btn.callback = self._on_rest
-        self.add_item(btn)
-
     async def _on_node_selected(self, interaction: discord.Interaction) -> None:
         node_id: str = interaction.data["values"][0]  # type: ignore[index]
 
@@ -809,9 +850,6 @@ class NodeSelectView(discord.ui.View):
             view      = tool_view,
             ephemeral = True,
         )
-
-    async def _on_rest(self, interaction: discord.Interaction) -> None:
-        await _handle_rest(interaction)
 
 
 class ToolSelectView(discord.ui.View):
@@ -891,14 +929,7 @@ class ToolSelectView(discord.ui.View):
                 await interaction.followup.send(_SWING_REJECTED_TEXT, ephemeral=True)
                 return
 
-        # ── Stamina check (cache; the DB re-checks in record_swing) ───────────
-        if player.stamina <= 0.0:
-            await interaction.followup.send(
-                "💨 You're exhausted! Use the **Rest** button to recover stamina.",
-                ephemeral=True,
-            )
-            return
-
+        # Stamina is checked by the DB in begin_swing (before n is issued).
         # ── Execute the swing (single path shared with auto mine) ─────────────
         try:
             outcome = await _mining_swing(guild_id, user_id, player, self.node_id, pickaxe, state, catalog)
@@ -1035,7 +1066,7 @@ async def explore_mines(interaction: discord.Interaction) -> None:
     The genesis trigger.
 
     1. Hydrates the server's world state (or loads from cache).
-    2. Sends a rich geology embed with a node selector and rest button.
+    2. Sends a rich geology embed with a node selector.
     """
     await interaction.response.defer()
 
@@ -1052,6 +1083,12 @@ async def explore_mines(interaction: discord.Interaction) -> None:
         profile, catalog, state = _hydrate_server(guild)
     except WorldPending:
         await interaction.followup.send(_WORLD_PENDING_TEXT, ephemeral=True)
+        return
+    try:
+        await _sync_nodes(guild.id)
+    except Exception:
+        log.exception("Node sync failed guild=%s", guild.id)
+        await interaction.followup.send(_DB_UNAVAILABLE_TEXT, ephemeral=True)
         return
 
     embed = _build_geology_embed(
@@ -1080,16 +1117,11 @@ async def inventory(interaction: discord.Interaction) -> None:
     """Show the calling player's current inventory and stamina in this server."""
     player = _get_player(interaction.guild_id, interaction.user.id)
 
-    stamina_bar = _reserve_bar(player.stamina / _DEFAULT_STAMINA)
     em = discord.Embed(
         title  = f"🎒  {interaction.user.display_name}'s Inventory",
         colour = discord.Colour.blurple(),
     )
-    em.add_field(
-        name  = "💪  Stamina",
-        value = f"{stamina_bar}  **{player.stamina:.1f}** / {_DEFAULT_STAMINA:.0f}",
-        inline = False,
-    )
+    em.add_field(name="💪  Stamina", value=_stamina_bar_text(player) + _stamina_recovery_hint(), inline=False)
     em.add_field(
         name  = "🔨  Equipped Tool",
         value = f"`{PICKAXES[player.pickaxe_key].name}`" if player.pickaxe_key in PICKAXES else "`None`",
@@ -1142,16 +1174,6 @@ async def inventory(interaction: discord.Interaction) -> None:
 
     em.set_footer(text="Use /explore_mines to mine | /rest to restore stamina")
     await interaction.response.send_message(embed=em, ephemeral=True)
-
-
-@bot.tree.command(
-    name        = "rest",
-    description = "Restore your stamina to full.",
-)
-@app_commands.guild_only()
-async def rest(interaction: discord.Interaction) -> None:
-    """Manual stamina restore command. Equivalent to the Rest button on the embed."""
-    await _handle_rest(interaction)
 
 
 @bot.tree.command(
@@ -1721,20 +1743,25 @@ async def _run_auto_mine(guild: discord.Guild, user_id: int, player: PlayerProfi
         _, catalog, state = _hydrate_server(guild)
     except WorldPending:
         return   # world still forming; the next interval will mine
+    try:
+        await _sync_nodes(guild.id)       # plan on the DB's reserves, not a fresh in-memory world
+    except Exception as exc:
+        log.warning("Auto-mine guild=%d user=%d skipped: node sync failed (%s)", guild.id, user_id, exc)
+        return
     pickaxe = PICKAXES.get(player.pickaxe_key, PICKAXES["copper_starter"])
     for _ in range(swings):
         plan = plan_swing(state, catalog, pickaxe)
         if plan is None:
             log.info("Auto-mine guild=%d user=%d: no minable node left", guild.id, user_id)
             return
-        stamina_before = player.stamina
+        if _stamina_now(player) < plan.min_stamina:
+            return   # stamina recovers with time only; try again next interval
         try:
             # Same path as manual mining: counter → roll → engine → inventory.
-            outcome = await _mining_swing(guild.id, user_id, player, plan.node_id, pickaxe,
-                                          state, catalog, rest_below=plan.min_stamina)
+            outcome = await _mining_swing(guild.id, user_id, player, plan.node_id, pickaxe, state, catalog)
         except SwingRejected:
-            return   # counter unavailable → no swing at all this interval
-        swing = AutoSwing(plan.node_label, outcome, player.stamina, stamina_before < plan.min_stamina)
+            return   # DB said no (unavailable, rate limit, stamina) → no swing this interval
+        swing = AutoSwing(plan.node_label, outcome, player.stamina)
         _AUTOMINE_LAST[(guild.id, user_id)] = swing
         log.info(
             "Auto-mine guild=%d user=%d #%d → %s %.4f t from %s%s",
@@ -1744,15 +1771,9 @@ async def _run_auto_mine(guild: discord.Guild, user_id: int, player: PlayerProfi
         )
 
 
-def _regenerate_world() -> None:
-    """One regeneration tick for every hydrated server (nodes refill slowly)."""
-    for state in _GLOBAL_SPAWN_REGISTRY.values():
-        _spawner.apply_regeneration_tick(state)
-
-
 @tasks.loop(seconds=TRACKER_TICK_SECONDS)
 async def _voice_tick() -> None:
-    """Sync all guilds, pay completed intervals (+ auto mine) through the DB, regenerate nodes."""
+    """Sync all guilds, pay completed intervals (+ auto mine) through the DB, refresh node reserves."""
     _voice_tracker.retain_guilds(g.id for g in bot.guilds)
     for guild in bot.guilds:
         try:
@@ -1760,10 +1781,7 @@ async def _voice_tick() -> None:
             await _pay_voice_rewards(guild)
         except Exception:
             log.exception("Voice tick failed for guild %s", guild.id)
-    try:
-        _regenerate_world()
-    except Exception:
-        log.exception("Node regeneration failed")
+    await _refresh_nodes()          # reserves + regen come from the DB clock
 
 
 @_voice_tick.before_loop
@@ -2100,7 +2118,7 @@ def _build_automine_embed(
     )
     em.add_field(
         name   = "💪  Stamina",
-        value  = f"{_reserve_bar(player.stamina / _DEFAULT_STAMINA, width=8)}\n**{player.stamina:.0f}** / {_DEFAULT_STAMINA:.0f}",
+        value  = _stamina_bar_text(player, width=8),
         inline = True,
     )
     if player.automine:
@@ -2274,11 +2292,21 @@ _SWING_REJECTED_TEXT: str = (
 _SWING_RULE_TEXT: Dict[str, str] = {
     "rate_limited":         "⏳ Terlalu cepat — batas ayunan per menit tercapai. Tunggu sebentar.",
     "insufficient_stamina": "💨 Stamina nggak cukup untuk ayunan ini.",
+    "node_depleted":        "🔴 Node ini sudah habis — tunggu regenerasi atau pilih node lain.",
+    "unknown_node":         "⚠️ Node belum terdaftar. Jalankan `/explore_mines` lagi.",
 }
 
 
+def _stamina_recovery_hint() -> str:
+    regen = float(_PRODUCTION_POLICY["stamina_regen_per_second"])
+    if regen <= 0:
+        return ""
+    return f"\n*Pulih {regen * 3600:.0f}/jam · penuh dari 0 dalam {_stamina_cap() / regen / 3600:.1f} jam*"
+
+
 def _swing_rejected_text(exc: SwingRejected) -> str:
-    return _SWING_RULE_TEXT.get(exc.code or "", _SWING_REJECTED_TEXT)
+    text = _SWING_RULE_TEXT.get(exc.code or "", _SWING_REJECTED_TEXT)
+    return text + (_stamina_recovery_hint() if exc.code == "insufficient_stamina" else "")
 
 
 async def _mining_swing(
@@ -2289,46 +2317,42 @@ async def _mining_swing(
     pickaxe:    Pickaxe,
     state:      ServerSpawnState,
     catalog:    ServerMaterialCatalog,
-    *,
-    rest_below: Optional[float] = None,
 ) -> SwingOutcome:
     """
     THE swing (manual and auto), serialised per player:
-      0. [auto only] rest_player first if stamina < rest_below (while policy allows /rest)
-      1. begin_swing: rate limit → n = counter + 1 (atomic) → stamina now (DB clock)
+      1. begin_swing: rate limit → stamina ≥ this node's cost → n = counter + 1
+         (atomic) → stamina and the node's reserve now (DB clock)
       2. roll = mining_roll(seed, guild, user, node, n) inside execute_swing — only after 1
-      3. record_swing: result + stamina + item in ONE transaction, once per n
+      3. record_swing: result + stamina + node reserve + item in ONE transaction, once per n
 
     Any DB failure raises SwingRejected: no fallback roll, no in-memory counter,
-    the node's reserve is put back, and the cache is untouched.
+    the node shows the DB's reserve again, and the cache is untouched.
     """
     record = _GLOBAL_WORLD_RECORDS.get(guild_id)
     if record is None or record.status != STATUS_ACTIVE:
         raise WorldPending(guild_id)
     seed = _world_seed(record)
+    node = state.active_ores.get(node_id) or state.active_crystals.get(node_id)
+    if node is None:
+        raise KeyError(f"node {node_id!r} tidak ada di server ini")
 
     async with _player_lock(guild_id, user_id):
         try:
-            if rest_below is not None and player.stamina < rest_below:
-                try:
-                    _, player.stamina = await _run_db(_economy_db.rest_player, guild_id, user_id)
-                except LedgerRejected as exc:
-                    if exc.code != "rest_disabled":
-                        raise
-            attempt, stamina = await _run_db(_economy_db.begin_swing, guild_id, user_id)
+            if guild_id not in _NODES_SYNCED:
+                await _sync_nodes(guild_id)
+            attempt, stamina, reserve = await _run_db(
+                _economy_db.begin_swing, guild_id, user_id, node_id, swing_stamina_cost(node, catalog))
         except LedgerRejected as exc:
             raise SwingRejected(str(exc), exc.code) from exc
         except Exception as exc:
             log.warning("Swing rejected guild=%d user=%d: attempt counter unavailable (%s)", guild_id, user_id, exc)
             raise SwingRejected(str(exc)) from exc
-        player.stamina = stamina
-
-        node = state.active_ores.get(node_id) or state.active_crystals.get(node_id)
-        before = (node.current_reserve, node.is_depleted) if node is not None else None
+        _set_stamina(player, stamina)
+        _apply_node_reserve(node, reserve)
+        before = (node.current_reserve, node.is_depleted)
 
         def restore_node() -> None:
-            if node is not None:
-                node.current_reserve, node.is_depleted = before
+            node.current_reserve, node.is_depleted = before
 
         try:
             outcome = execute_swing(
@@ -2341,7 +2365,7 @@ async def _mining_swing(
             raise
         item = outcome.item
         try:
-            stamina_after, item_id, _ = await _run_db(
+            stamina_after, item_id, _, reserve_after = await _run_db(
                 _economy_db.record_swing, guild_id, user_id, attempt,
                 node_id=node_id, success=outcome.result.success, critical_hit=outcome.result.critical_hit,
                 amount_extracted=outcome.result.amount_extracted,
@@ -2354,11 +2378,13 @@ async def _mining_swing(
             restore_node()
             raise SwingRejected(str(exc), exc.code) from exc
         except Exception as exc:
-            restore_node()
+            restore_node()     # the next node sync shows the DB's truth, even if this did commit
             log.warning("Swing #%d guild=%d user=%d not recorded (%s) — discarded", attempt, guild_id, user_id, exc)
             raise SwingRejected(str(exc)) from exc
 
-        player.stamina = stamina_after
+        _set_stamina(player, stamina_after)
+        if reserve_after is not None:
+            _apply_node_reserve(node, reserve_after)
         if item_id is not None and item is not None:
             player.held[item_id] = item
         return outcome

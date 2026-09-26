@@ -75,7 +75,9 @@ class FakeChannel:
 class FakeDB(LedgerModel):
     """Stands in for db_ekonomi_pusat.EconomyDatabase: schema-v7 ledger model + the other tables."""
     def __init__(self, currencies=None, configs=None):
-        super().__init__(clock=lambda: 0.0)
+        super().__init__(clock=lambda: self.now)
+        self.now = 0.0                                   # DB clock (seconds), advanced by tests
+        self.policy["max_swings_per_minute"] = None      # most tests swing a lot at t=0; [R] tests the limit
         self.currencies = currencies or {}
         self.configs = configs or {}
         self.upserted_configs = []
@@ -147,6 +149,7 @@ def install(fake, source=None):
 
 
 def reset_state():
+    mc._NODES_SYNCED.clear()
     for reg in (mc._GLOBAL_PLAYER_REGISTRY, mc._VOICE_UNSENT, mc._VOICE_OUTBOX, mc._GLOBAL_CURRENCY_REGISTRY,
                 mc._GLOBAL_VOICE_CONFIG_REGISTRY, mc._GLOBAL_SPAWN_REGISTRY,
                 mc._GLOBAL_CATALOG_REGISTRY, mc._GLOBAL_PROFILE_REGISTRY, mc._GLOBAL_WORLD_RECORDS,
@@ -175,6 +178,19 @@ def activate_world(gid, label=None, worldgen_version="dev"):
                       worldgen_version)
     mc._GLOBAL_WORLD_RECORDS[gid] = rec
     return rec
+
+
+def refill(fake, gid, uid):
+    """Test fixture: set a player's stamina in the fake DB to the cap (there is no /rest any more)."""
+    p = fake._player(gid, uid)
+    p["stamina"], p["stamina_at"] = fake.policy["stamina_cap"], fake.now
+
+
+def refill_node(fake, gid, node_id):
+    """Test fixture: fill a node to max in the fake DB (reserves are authoritative there since v8)."""
+    if (gid, node_id) in fake.nodes:
+        n = fake.nodes[(gid, node_id)]
+        n["reserve"], n["reserve_at"] = n["max_reserve"], fake.now
 
 
 def forget_world(gid):
@@ -222,6 +238,7 @@ async def main():
                           "Prismatic", 0.5, 0.33, "CRYSTAL_CAVERN", 2.0)
         fake.counters[(7, 42)] = 2
         fake._player(7, 42)
+        fake.register_nodes(7, [{"node_id": "x", "max_reserve": 1000.0, "regen_per_second": 0.0}])
         for n, it, kind in ((1, ore, "ore"), (2, cry, "crystal")):
             fake.record_swing(7, 42, n, node_id="x", success=True, critical_hit=False, amount_extracted=1.0,
                               stamina_consumed=10.0, item_kind=kind, item_uuid=it.item_uuid, item_payload=it.to_dict())
@@ -372,11 +389,18 @@ async def main():
         check("status ada ayunan terakhir", any("Ayunan terakhir" in f.name for f in em.fields), True)
 
         state = mc._GLOBAL_SPAWN_REGISTRY[4242]
-        for n in [*state.active_ores.values(), *state.active_crystals.values()]:
-            n.current_reserve, n.is_depleted = 0.0, True
+        fake_j = mc._economy_db
+        for (gid_n, nid), row in fake_j.nodes.items():
+            if gid_n == 4242:
+                row["reserve"], row["reserve_at"] = 0.0, fake_j.now      # habis di DB
         with mock.patch.object(type(mc.bot), "guilds", new_callable=mock.PropertyMock, return_value=[g]):
             await mc._voice_tick.coro()
-        check("regenerasi jalan tiap tick", any(not n.is_depleted for n in state.active_ores.values()), True)
+            check("node habis di DB → tick menampilkan habis (bukan penuh dari memori)",
+                  all(n.is_depleted for n in state.active_ores.values()), True)
+            fake_j.now += 600                                              # 10 menit jam DB
+            await mc._voice_tick.coro()
+        check("regenerasi dari jam DB: setelah 10 menit node terisi lagi",
+              all(0 < n.current_reserve <= n.max_reserve for n in state.active_ores.values()), True)
 
         inter = interaction_for(g, a)
         await mc.automine_berhenti.callback(inter)
@@ -571,20 +595,20 @@ async def main():
             # (a) /rest, then swing the SAME node 100× with full stamina every time
             ns, crits = [], []
             for _ in range(100):
-                st_m.active_ores[node].current_reserve = st_m.active_ores[node].max_reserve   # keep node full
-                st_m.active_ores[node].is_depleted = False
-                await mc.rest.callback(interaction_for(gm, miner_user))
+                refill_node(fake, GID, node)                                             # keep node full (DB)
+                refill(fake, GID, UID)
                 n, em, _ = await manual_swing()
                 ns.append(n)
                 crits.append("CRIT" in em.footer.text)
             rolls = {mining_roll(seed_m, GID, UID, node, n) for n in ns}
             check("(a) footer embed menampilkan nomor percobaan #1..#100", ns, list(range(1, 101)))
-            check("(a) 100 ayunan setelah /rest → 100 roll berbeda", len(rolls), 100)
+            check("(a) 100 ayunan dengan stamina penuh → 100 roll berbeda", len(rolls), 100)
             check("(a) crit TIDAK berulang (bukan selalu / bukan tidak pernah)", 0 < sum(crits) < 100, True)
             check("(a) roll dihitung SETELAH counter naik", all(c.get((GID, UID)) == i + 1 for i, c in enumerate(calls[:100])), True)
 
             # (b) 50 parallel swings of the same user → 50 unique n
-            await mc.rest.callback(interaction_for(gm, miner_user))     # stamina lives in the DB now
+            fake.policy["stamina_cap"] = 1e9                               # 50 swings need 50× stamina
+            refill(fake, GID, UID)
             before = fake.counters[(GID, UID)]
             par = await asyncio.gather(*[manual_swing() for _ in range(50)])
             par_ns = [n for n, _, _ in par]
@@ -599,7 +623,7 @@ async def main():
             _, cat_m, st_m = mc._hydrate_server(gm)
             check("(c) setelah restart stamina = nilai DB (bukan default memori)",
                   mc._get_player(GID, UID).stamina, fake.players[(GID, UID)]["stamina"])
-            await mc.rest.callback(interaction_for(gm, miner_user))
+            refill(fake, GID, UID)
             n_after, _, _ = await manual_swing()
             check("(c) setelah restart n lanjut dari DB", n_after, last_n + 1)
 
@@ -708,9 +732,8 @@ async def main():
 
         async def mine_one_ore():
             for _ in range(20):
-                st_q.active_ores[node_q].current_reserve = st_q.active_ores[node_q].max_reserve
-                st_q.active_ores[node_q].is_depleted = False
-                await mc.rest.callback(interaction_for(gq, miner_q))
+                refill_node(fake, GQ, node_q)
+                refill(fake, GQ, UQ)
                 await swing_q()
                 ores = [(iid, it) for iid, it in mc._get_player(GQ, UQ).held.items() if isinstance(it, OreItem)]
                 if ores:
@@ -810,6 +833,104 @@ async def main():
         check("audit: wallet = Σ ledger untuk semua pemain, rantai saldo utuh",
               (audit["wallet_mismatch"], audit["balance_chain_broken"], audit["sale_without_disposal"],
                audit["results_beyond_counter"]), ([], 0, 0, 0))
+
+        print("\n[R] v8: cadangan node di DB + batas produksi (tanpa /rest)")
+        names_r = {c.name for c in mc.bot.tree.get_commands()}
+        check("/rest sudah tidak ada", "rest" in names_r, False)
+        reset_state()
+        mc._NODES_SYNCED.clear()
+        fake = install(FakeDB())
+        mc._PRODUCTION_POLICY.update(fake.load_production_policy())
+        GR, UR = 7171, 42
+        gr = make_guild(GR)
+        gr.me = FakeMember(999, bot=True)
+        rec_r = activate_world(GR)
+        inter = interaction_for(gr, FakeMember(UR))
+        await mc.explore_mines.callback(inter)
+        view_r = inter.followup.sent[0][1].get("view")
+        check("embed /explore_mines tanpa tombol Rest",
+              any("rest" in (getattr(c, "custom_id", "") or "") for c in view_r.children), False)
+        _, cat_r, st_r = mc._hydrate_server(gr)
+        node_r = max(st_r.active_ores, key=lambda nid: st_r.active_ores[nid].max_reserve)
+        check("/explore_mines mendaftarkan semua node di DB",
+              {nid for (g_, nid) in fake.nodes if g_ == GR}, {*st_r.active_ores, *st_r.active_crystals})
+        miner_r = FakeMember(UR)
+
+        async def swing_r(pick="abyss_resonator"):
+            inter = interaction_for(gr, miner_r)
+            inter.data = {"values": [pick]}
+            await mc.ToolSelectView(GR, node_r, UR)._on_tool_selected(inter)
+            return inter.followup.sent[0]
+
+        content, kw = await swing_r()
+        db_reserve = fake._node_now(fake.nodes[(GR, node_r)])
+        check("ayunan mengurangi cadangan node di DB; memori = DB",
+              (db_reserve < st_r.active_ores[node_r].max_reserve,
+               abs(st_r.active_ores[node_r].current_reserve - db_reserve) < 1e-6), (True, True))
+
+        reset_state()                                          # restart
+        mc._NODES_SYNCED.clear()
+        mc._GLOBAL_WORLD_RECORDS[GR] = rec_r
+        await mc._load_persistent_state()
+        _, cat_r, st_r = mc._hydrate_server(gr)
+        check("restart tanpa sync: dunia baru di memori masih penuh (inilah celah lama)",
+              st_r.active_ores[node_r].current_reserve, st_r.active_ores[node_r].max_reserve)
+        await mc._sync_nodes(GR)
+        check("setelah sync: cadangan = DB (restart TIDAK mengisi ulang node)",
+              abs(st_r.active_ores[node_r].current_reserve - db_reserve) < 1e-6, True)
+
+        p = fake._player(GR, UR)
+        p["stamina"], p["stamina_at"] = 1.0, fake.now
+        mc._get_player(GR, UR).stamina = 1.0
+        n0 = fake.counters[(GR, UR)]
+        content, _ = await swing_r()
+        check("stamina kurang → ditolak sebelum counter naik, pesan menyebut laju pulih",
+              ("Stamina nggak cukup" in content, "Pulih 50/jam" in content, fake.counters[(GR, UR)]), (True, True, n0))
+        fake.now += 3600                                       # 1 jam jam DB → +50 stamina
+        content, kw = await swing_r()
+        check("setelah 1 jam stamina pulih dari waktu → ayunan jalan", fake.counters[(GR, UR)], n0 + 1)
+
+        fake.policy["max_swings_per_minute"] = 6
+        refill(fake, GR, UR)
+        fake.policy["stamina_cap"] = 1e9
+        refill(fake, GR, UR)
+        fake.now += 120                                        # jendela 1 menit baru
+        results = []
+        for _ in range(7):
+            content, kw = await swing_r()
+            results.append("Terlalu cepat" in (content or ""))
+        check("batas 6 ayunan/menit: ayunan ke-7 ditolak", (results[:6], results[6]), ([False] * 6, True))
+        fake.policy["max_swings_per_minute"] = None
+
+        real_begin = fake.begin_swing
+        def begin_then_someone_else_mines(*a, **k):
+            out = real_begin(*a, **k)
+            node = fake.nodes[(GR, node_r)]
+            node["reserve"], node["reserve_at"] = 0.0, fake.now   # pemain lain menghabiskan node di antaranya
+            return out
+        fake.now += 10_000
+        with mock.patch.object(fake, "begin_swing", begin_then_someone_else_mines):
+            held_before = len(mc._get_player(GR, UR).held)
+            content, _ = await swing_r()
+        check("node dihabiskan orang lain di tengah ayunan → DB menolak (node_depleted), tas tidak berubah",
+              ("Node ini sudah habis" in content, len(mc._get_player(GR, UR).held)), (True, held_before))
+
+        fake.now += 10_000
+        fake.lose_response("record_swing")                     # commit, respons hilang
+        content, _ = await swing_r()
+        await mc._sync_nodes(GR)
+        check("respons record_swing hilang → sync berikutnya menampilkan cadangan DB",
+              abs(st_r.active_ores[node_r].current_reserve - fake._node_now(fake.nodes[(GR, node_r)])) < 1e-6, True)
+
+        mc._get_player(GR, UR).automine = True
+        p = fake._player(GR, UR)
+        fake.policy["stamina_cap"] = 100.0
+        p["stamina"], p["stamina_at"] = 0.0, fake.now
+        mc._get_player(GR, UR).stamina, mc._get_player(GR, UR).stamina_at = 0.0, mc.time.time()
+        n0 = fake.counters[(GR, UR)]
+        await mc._run_auto_mine(gr, UR, mc._get_player(GR, UR), 3)
+        check("auto mine dengan stamina habis → melewati interval, tidak ada counter terbuang",
+              fake.counters[(GR, UR)], n0)
 
         print("\n[I] Cek bawaan: embed /found_currency (kode lama) muat di batas 1024")
         field = f"```text\n{preview_manifest(manifest)}\n```"

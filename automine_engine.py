@@ -13,7 +13,7 @@
 ║    1. choose_best_node() → node non-depleted dengan yield (ton) terbesar    ║
 ║       untuk pickaxe player, memakai rumus yang sama dengan MiningEngine.   ║
 ║    2. min_stamina = biaya ayunan node itu; kalau stamina di bawahnya,       ║
-║       main_core istirahat otomatis dulu (setara /rest yang memang gratis).  ║
+║       interval ini dilewati — stamina hanya pulih dari waktu (schema v8).   ║
 ║  Ayunannya sendiri lewat main_core._mining_swing → mining_swing.execute_    ║
 ║  swing — JALUR YANG SAMA PERSIS dengan mining manual (counter atomik di     ║
 ║  Supabase, roll = mining_roll(...)).  Tidak ada jalur roll kedua.           ║
@@ -47,7 +47,7 @@ class AutoPlan:
     """Rencana satu ayunan otomatis."""
     node_id:     str
     node_label:  str
-    min_stamina: float        # biaya ayunan node ini; di bawahnya → istirahat dulu
+    min_stamina: float        # biaya ayunan node ini; di bawahnya → lewati interval ini
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,6 @@ class AutoSwing:
     node_label:    str
     outcome:       SwingOutcome
     stamina_after: float
-    rested:        bool
 
     @property
     def result(self):
@@ -158,7 +157,7 @@ if __name__ == "__main__":
                         node_id=plan.node_id, pickaxe=pick, stamina=100.0, state=state, catalog=catalog)
     check("cadangan berkurang sesuai hasil", round(before - all_nodes[best].current_reserve, 4),
           out.result.amount_extracted)
-    rec = AutoSwing(plan.node_label, out, 100.0 - out.result.stamina_consumed, False)
+    rec = AutoSwing(plan.node_label, out, 100.0 - out.result.stamina_consumed)
     check("AutoSwing mengekspos attempt/result/item", (rec.attempt, rec.result is out.result, rec.item is out.item),
           (1, True, True))
 

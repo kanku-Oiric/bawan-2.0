@@ -52,6 +52,7 @@ TABLE_ITEM_DISPOSALS: str = "item_disposals"
 TABLE_MINING_RESULTS: str = "mining_results"
 TABLE_VOICE_TICKS: str = "voice_ticks"
 TABLE_PRODUCTION_POLICY: str = "production_policy"
+TABLE_NODE_STATE: str = "node_state"
 
 # Kolom yang WAJIB ada; dicek saat startup supaya migrasi yang terlewat
 # langsung ketahuan, bukan gagal diam-diam di setiap flush.
@@ -80,6 +81,7 @@ _REQUIRED_COLUMNS = {
     ),
     TABLE_VOICE_TICKS: "ref,guild_id,created_at",
     TABLE_PRODUCTION_POLICY: "scope,stamina_cap,stamina_regen_per_second,max_swings_per_minute,rest_enabled",
+    TABLE_NODE_STATE: "guild_id,node_id,max_reserve,regen_per_second,reserve,reserve_at,registered_at",
 }
 
 # wallet dibaca sebagai teks → Decimal: numeric(24,4) tidak lewat float.
@@ -322,28 +324,51 @@ class EconomyDatabase:
 
     # ── Saldo otoritatif (schema v7) — satu RPC = satu transaksi ─────────────
 
-    def begin_swing(self, guild_id: int, user_id: int) -> Tuple[int, float]:
-        """Rate limit → counter n naik atomik → (n, stamina saat ini menurut jam DB)."""
-        row = self._rpc_row("begin_swing", {"p_guild_id": guild_id, "p_user_id": user_id})
-        attempt, stamina = row.get("attempt"), row.get("stamina")
-        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1 \
-                or not isinstance(stamina, (int, float)) or isinstance(stamina, bool):
+    def begin_swing(self, guild_id: int, user_id: int, node_id: str,
+                    stamina_required: float) -> Tuple[int, float, float]:
+        """
+        Rate limit → stamina cukup? → counter n naik atomik.
+        Returns (n, stamina saat ini, cadangan node saat ini) — keduanya menurut jam DB.
+        """
+        row = self._rpc_row("begin_swing", {"p_guild_id": guild_id, "p_user_id": user_id,
+                                            "p_node_id": node_id, "p_stamina_required": float(stamina_required)})
+        attempt, stamina, reserve = row.get("attempt"), row.get("stamina"), row.get("node_reserve")
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1 or not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) for v in (stamina, reserve)):
             raise NotSupabaseResponse(f"rpc begin_swing: respons tidak valid {row!r}. {_URL_HINT}")
-        return attempt, float(stamina)
+        return attempt, float(stamina), float(reserve)
 
     def record_swing(
         self, guild_id: int, user_id: int, attempt: int, *, node_id: str, success: bool,
         critical_hit: bool, amount_extracted: float, stamina_consumed: float,
         item_kind: Optional[str], item_uuid: Optional[str], item_payload: Optional[dict],
-    ) -> Tuple[float, Optional[str], bool]:
-        """Catat hasil ayunan n sekali.  Returns (stamina_after, item_id|None, already)."""
+    ) -> Tuple[float, Optional[str], bool, Optional[float]]:
+        """Catat hasil ayunan n sekali.  Returns (stamina_after, item_id|None, already, cadangan node sesudahnya)."""
         row = self._rpc_row("record_swing", {
             "p_guild_id": guild_id, "p_user_id": user_id, "p_attempt": attempt, "p_node_id": node_id,
             "p_success": success, "p_critical_hit": critical_hit,
             "p_amount_extracted": float(amount_extracted), "p_stamina_consumed": float(stamina_consumed),
             "p_item_kind": item_kind, "p_item_uuid": item_uuid, "p_item_payload": item_payload,
         })
-        return float(row["stamina_after"]), row["item_id"], bool(row["already"])
+        reserve = row.get("node_reserve")
+        return (float(row["stamina_after"]), row["item_id"], bool(row["already"]),
+                None if reserve is None else float(reserve))
+
+    def register_nodes(self, guild_id: int, nodes: Sequence[dict]) -> List[dict]:
+        """
+        Daftarkan node (insert-or-ignore: max_reserve/regen yang sudah tersimpan TIDAK ditimpa),
+        lalu kembalikan semua node guild itu dengan cadangan saat ini.  nodes=[] → hanya membaca.
+        """
+        payload = [{"node_id": n["node_id"], "max_reserve": float(n["max_reserve"]),
+                    "regen_per_second": float(n["regen_per_second"])} for n in nodes]
+        return _rows(self._rpc("register_nodes", {"p_guild_id": guild_id, "p_nodes": payload}), "rpc register_nodes")
+
+    def load_production_policy(self) -> dict:
+        rows = _rows(self._db.table(TABLE_PRODUCTION_POLICY).select("*").eq("scope", "global").execute().data,
+                     f"select {TABLE_PRODUCTION_POLICY}")
+        if len(rows) != 1:
+            raise RuntimeError("production_policy 'global' tidak ada — jalankan ulang supabase/schema.sql")
+        return rows[0]
 
     def sell_item(self, guild_id: int, user_id: int, item_id: str, payout: object, kind: str) -> Tuple[Decimal, bool]:
         """Jual satu barang (sekali saja).  Returns (saldo baru, already=penjualan yang sama di-retry)."""
@@ -364,10 +389,6 @@ class EconomyDatabase:
         for row in rows:
             row["wallet"] = parse_money(row["wallet"])
         return rows
-
-    def rest_player(self, guild_id: int, user_id: int) -> Tuple[float, float]:
-        row = self._rpc_row("rest_player", {"p_guild_id": guild_id, "p_user_id": user_id})
-        return float(row["stamina_before"]), float(row["stamina"])
 
     def set_player_prefs(self, guild_id: int, user_id: int, pickaxe_key: Optional[str] = None,
                          automine: Optional[bool] = None) -> Tuple[str, bool]:
@@ -634,28 +655,81 @@ if __name__ == "__main__":
                     check(label, "ditolak" if needle in str(exc) else f"error lain: {str(exc)[:160]}", "ditolak")
 
             payload = {"item_uuid": "ab" * 32, "element_symbol": "Fe", "purity": "Crude", "weight_tonnes": 1.5}
-            n1, st1 = gw.begin_swing(LG, U)
-            check("begin_swing: n pertama = 1, stamina = cap 100", (n1, st1), (1, 100.0))
-            after, item_id, again = gw.record_swing(
-                LG, U, n1, node_id="test:Fe:0", success=True, critical_hit=False, amount_extracted=1.5,
+            NODE = f"test:{run}:Fe:0"
+            policy = gw.load_production_policy()
+            check("kebijakan produksi v8: cap 100, regen 50/jam, 6 ayunan/menit, /rest mati",
+                  (policy["stamina_cap"], round(policy["stamina_regen_per_second"] * 3600, 6),
+                   policy["max_swings_per_minute"], policy["rest_enabled"]), (100, 50.0, 6, False))
+            rejected("begin_swing di node yang belum terdaftar", "unknown_node",
+                     lambda: gw.begin_swing(LG, U, NODE, 10.0))
+            reg = {r["node_id"]: r for r in gw.register_nodes(LG, [{"node_id": NODE, "max_reserve": 100.0,
+                                                                     "regen_per_second": 0.5}])}
+            check("register_nodes: node baru mulai penuh", reg[NODE]["reserve"], 100.0)
+            again_reg = {r["node_id"]: r for r in gw.register_nodes(LG, [{"node_id": NODE, "max_reserve": 9999.0,
+                                                                           "regen_per_second": 99.0}])}
+            check("register_nodes ulang TIDAK menimpa parameter tersimpan",
+                  (again_reg[NODE]["max_reserve"], again_reg[NODE]["regen_per_second"]), (100.0, 0.5))
+            n1, st1, res1 = gw.begin_swing(LG, U, NODE, 10.0)
+            check("begin_swing: n pertama = 1, stamina = cap 100, node penuh", (n1, st1, res1), (1, 100.0, 100.0))
+            after, item_id, again, node_after = gw.record_swing(
+                LG, U, n1, node_id=NODE, success=True, critical_hit=False, amount_extracted=30.0,
                 stamina_consumed=10.0, item_kind="ore", item_uuid=payload["item_uuid"], item_payload=payload)
-            check("record_swing: stamina berkurang, barang tercatat", (after, item_id, again),
-                  (90.0, f"swing:{LG}:{U}:{n1}", False))
-            check("record_swing di-retry → hasil yang sama, tidak dobel",
-                  gw.record_swing(LG, U, n1, node_id="test:Fe:0", success=True, critical_hit=False,
-                                  amount_extracted=1.5, stamina_consumed=10.0, item_kind="ore",
-                                  item_uuid=payload["item_uuid"], item_payload=payload),
-                  (90.0, item_id, True))
+            check("record_swing: stamina & cadangan node berkurang di transaksi yang sama, barang tercatat",
+                  (round(after, 3), item_id, again, round(node_after, 3)), (90.0, f"swing:{LG}:{U}:{n1}", False, 70.0))
+            retry = gw.record_swing(LG, U, n1, node_id=NODE, success=True, critical_hit=False,
+                                    amount_extracted=30.0, stamina_consumed=10.0, item_kind="ore",
+                                    item_uuid=payload["item_uuid"], item_payload=payload)
+            check("record_swing di-retry → hasil yang sama, tidak dobel (node tidak berkurang lagi)",
+                  (round(retry[0], 3), retry[1], retry[2], retry[3] < 100.0 and retry[3] >= 70.0),
+                  (90.0, item_id, True, True))
+            _time.sleep(2.0)
+            _, st_regen, res_regen = gw.begin_swing(LG, U, NODE, 0.0)
+            check("stamina pulih dari waktu (jam DB): naik tapi ≤ 50/jam", 90.0 < st_regen <= 90.0 + 50 / 3600 * 10,
+                  True)
+            check("cadangan node pulih dari waktu: 70 + 0.5/detik", 70.0 + 0.5 < res_regen <= 70.0 + 0.5 * 10, True)
             rejected("record_swing untuk n yang belum dikeluarkan counter", "attempt_not_issued",
                      lambda: gw.record_swing(LG, U, n1 + 5, node_id="x", success=False, critical_hit=False,
                                              amount_extracted=0, stamina_consumed=0, item_kind=None,
                                              item_uuid=None, item_payload=None))
-            n2, _ = gw.begin_swing(LG, U)
+            n_before = gw.begin_swing(LG, U, NODE, 0.0)[0]
+            rejected("begin_swing dengan stamina kurang → ditolak SEBELUM counter naik", "insufficient_stamina",
+                     lambda: gw.begin_swing(LG, U, NODE, 1000.0))
+            check("… counter tidak terbuang", gw.begin_swing(LG, U, NODE, 0.0)[0], n_before + 1)
             rejected("record_swing dengan stamina tidak cukup", "insufficient_stamina",
-                     lambda: gw.record_swing(LG, U, n2, node_id="x", success=True, critical_hit=False,
+                     lambda: gw.record_swing(LG, U, n_before, node_id=NODE, success=True, critical_hit=False,
                                              amount_extracted=0, stamina_consumed=1000, item_kind=None,
                                              item_uuid=None, item_payload=None))
-            check("rest_player → stamina = cap", gw.rest_player(LG, U), (90.0, 100.0))
+            rejected("record_swing mengambil lebih dari cadangan node", "node_depleted",
+                     lambda: gw.record_swing(LG, U, n_before, node_id=NODE, success=True, critical_hit=False,
+                                             amount_extracted=10_000, stamina_consumed=0, item_kind=None,
+                                             item_uuid=None, item_payload=None))
+            EDGE = f"test:{run}:edge"
+            gw.register_nodes(LG, [{"node_id": EDGE, "max_reserve": 10.00008, "regen_per_second": 0.0}])
+            n_edge, _, _ = gw.begin_swing(LG, U, EDGE, 0.0)
+            edge = gw.record_swing(LG, U, n_edge, node_id=EDGE, success=True, critical_hit=False,
+                                   amount_extracted=round(10.00008, 4), stamina_consumed=0, item_kind=None,
+                                   item_uuid=None, item_payload=None)
+            check("ambil seluruh sisa node, hasil dibulatkan NAIK ke 4 desimal (10.0001 > 10.00008) → diterima, node 0",
+                  (round(10.00008, 4) > 10.00008, edge[2], edge[3]), (True, False, 0.0))
+            refused("UPDATE cadangan node langsung (service_role) ditolak", "node_outside_swing",
+                    lambda: raw.table(TABLE_NODE_STATE).update({"reserve": 100}).eq("guild_id", LG)
+                               .eq("node_id", NODE).execute())
+            refused("DELETE node ditolak", "node_delete_forbidden",
+                    lambda: raw.table(TABLE_NODE_STATE).delete().eq("guild_id", LG).eq("node_id", NODE).execute())
+            try:
+                raw.rpc("rest_player", {"p_guild_id": LG, "p_user_id": U}).execute()
+                check("rest_player sudah dihapus", "masih ada", "hilang")
+            except Exception:
+                check("rest_player sudah dihapus", "hilang", "hilang")
+            RL = run + 3                                      # pemain baru khusus uji batas ayunan
+            recorded = 0
+            for _ in range(6):
+                n_rl, _, _ = gw.begin_swing(LG, RL, NODE, 0.0)
+                gw.record_swing(LG, RL, n_rl, node_id=NODE, success=False, critical_hit=False,
+                                amount_extracted=0, stamina_consumed=0, item_kind=None, item_uuid=None, item_payload=None)
+                recorded += 1
+            rejected(f"ayunan ke-7 dalam 1 menit ditolak (batas 6)", "rate_limited",
+                     lambda: gw.begin_swing(LG, RL, NODE, 0.0))
             check("set_player_prefs tersimpan", gw.set_player_prefs(LG, U, pickaxe_key="iron_standard", automine=True),
                   ("iron_standard", True))
 
@@ -772,15 +846,17 @@ if __name__ == "__main__":
         BOT_TABLES = {TABLE_PLAYERS, TABLE_CURRENCIES, TABLE_VOICE_CONFIG, TABLE_SERVER_REGISTRY,
                       TABLE_WORLD_NONCES, TABLE_WORLD_COMMITMENTS, TABLE_WORLD_WITNESS_LOG,
                       TABLE_MINING_ATTEMPTS, TABLE_LEDGER, TABLE_ITEMS, TABLE_ITEM_DISPOSALS,
-                      TABLE_MINING_RESULTS, TABLE_VOICE_TICKS, TABLE_PRODUCTION_POLICY}
+                      TABLE_MINING_RESULTS, TABLE_VOICE_TICKS, TABLE_PRODUCTION_POLICY, TABLE_NODE_STATE}
         BOT_FUNCTIONS = {"register_server(bigint,text,text,text)", "security_report()",
-                         "next_mining_attempt(bigint,bigint)", "begin_swing(bigint,bigint)",
+                         "next_mining_attempt(bigint,bigint)", "begin_swing(bigint,bigint,text,double precision)",
                          "record_swing(bigint,bigint,bigint,text,boolean,boolean,double precision,"
                          "double precision,text,text,jsonb)",
                          "sell_item(bigint,bigint,text,numeric,text)", "apply_voice_tick(bigint,text,jsonb)",
-                         "rest_player(bigint,bigint)", "set_player_prefs(bigint,bigint,text,boolean)",
+                         "set_player_prefs(bigint,bigint,text,boolean)", "register_nodes(bigint,jsonb)",
                          "money_supply(bigint)", "ledger_audit()"}
-        RETIRED_FUNCTIONS = {"register_server(bigint,text,text)"}   # v6: registrasi tanpa worldgen_version
+        RETIRED_FUNCTIONS = {"register_server(bigint,text,text)",      # v6: registrasi tanpa worldgen_version
+                             "begin_swing(bigint,bigint)",              # v8: tanpa node & stamina minimum
+                             "rest_player(bigint,bigint)"}              # v8: /rest dihapus
 
         prod = EconomyDatabase(create_client(normalize_supabase_url(os.getenv("SUPABASE_URL", "")),
                                              os.getenv("SUPABASE_KEY", "")))
@@ -802,7 +878,8 @@ if __name__ == "__main__":
                   (f["anon_execute"], f["auth_execute"]), (False, False))
         present = {r["function"] for r in report["functions"]}
         check("semua fungsi bot ada di laporan", sorted(BOT_FUNCTIONS - present), [])
-        check("fungsi lama sudah dihapus (register_server 3 argumen)", sorted(RETIRED_FUNCTIONS & present), [])
+        check("fungsi lama sudah dihapus (register_server 3 arg, begin_swing 2 arg, rest_player)",
+              sorted(RETIRED_FUNCTIONS & present), [])
 
         anon_key = os.getenv("SUPABASE_TEST_ANON_KEY", "").strip()
         if not anon_key:
@@ -836,6 +913,8 @@ if __name__ == "__main__":
                                                        "p_entries": []}).execute()),
                 ("anon SELECT ledger",
                  lambda: anon.table(TABLE_LEDGER).select("*").limit(1).execute()),
+                ("anon RPC register_nodes",
+                 lambda: anon.rpc("register_nodes", {"p_guild_id": -999, "p_nodes": []}).execute()),
                 ("anon UPDATE production_policy",
                  lambda: anon.table(TABLE_PRODUCTION_POLICY).update({"rest_enabled": True}).eq("scope", "global").execute()),
             ]:

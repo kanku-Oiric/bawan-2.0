@@ -21,7 +21,7 @@ from typing import Optional, Union
 
 from crystal import CrystalFactory, CrystalItem, VARIANT_GEM, VARIANT_SPLINTER
 from material_gen import ServerMaterialCatalog
-from mining_engine import MiningEngine, MiningResult, Pickaxe
+from mining_engine import MiningEngine, MiningResult, Pickaxe, _stamina_cost
 from ore import OreFactory, OreItem
 from resource_spawner import ServerSpawnState
 from world_stream import mining_roll
@@ -33,6 +33,11 @@ class SwingOutcome:
     roll:    int                                   # 256-bit; recomputable after reveal
     result:  MiningResult
     item:    Optional[Union[OreItem, CrystalItem]]
+
+
+def swing_stamina_cost(node, catalog: ServerMaterialCatalog) -> float:
+    """Stamina one swing at this node costs — exactly what MiningEngine checks (depth × pressure)."""
+    return _stamina_cost(node.depth_layer, catalog.pressure_index)
 
 
 def execute_swing(

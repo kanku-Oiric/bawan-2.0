@@ -368,6 +368,17 @@ def _crystal_max_reserve(quality: str, crystal_affinity: str) -> float:
 # SECTION 5 — RESOURCE SPAWNER ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Crystals regain this share of max_reserve per regeneration tick.
+CRYSTAL_REGEN_FRACTION_PER_TICK: float = 0.005
+
+
+def regeneration_per_tick(node: ActiveOreNode | ActiveCrystalNode) -> float:
+    """Units a node regains per regeneration tick — the rule apply_regeneration_tick() uses."""
+    if isinstance(node, ActiveCrystalNode):
+        return round(node.max_reserve * CRYSTAL_REGEN_FRACTION_PER_TICK, 6)
+    return node.regeneration_rate
+
+
 class ResourceSpawner:
     """
     Translates a frozen ServerMaterialCatalog into a live, mutable
@@ -593,7 +604,7 @@ class ResourceSpawner:
                 if node.current_reserve >= node.max_reserve:
                     continue
                 # Crystal tick rate: 0.5% of max per tick (slow geological cycle)
-                tick_rate = round(node.max_reserve * 0.005, 6)
+                tick_rate = regeneration_per_tick(node)
                 gain      = min(tick_rate, node.max_reserve - node.current_reserve)
                 gain      = round(gain, 6)
                 node.current_reserve = round(node.current_reserve + gain, 6)

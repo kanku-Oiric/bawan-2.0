@@ -1,5 +1,5 @@
 """
-In-memory reference model of the schema-v7 ledger RPCs (supabase/schema.sql).
+In-memory reference model of the schema-v7/v8 ledger + node RPCs (supabase/schema.sql).
 
 Same method names, arguments, return values and rule codes as
 db_ekonomi_pusat.EconomyDatabase, so bot code can be tested offline.  Every
@@ -28,8 +28,9 @@ from voice_engine import level_for_xp
 
 
 class LedgerModel:
-    POLICY_DEFAULTS = {"stamina_cap": 100.0, "stamina_regen_per_second": 0.0,
-                       "max_swings_per_minute": None, "rest_enabled": True}
+    # = production_policy after schema v8
+    POLICY_DEFAULTS = {"stamina_cap": 100.0, "stamina_regen_per_second": 50.0 / 3600,
+                       "max_swings_per_minute": 6, "rest_enabled": False}
 
     def __init__(self, clock=time.time) -> None:
         self.clock = clock
@@ -43,6 +44,7 @@ class LedgerModel:
         self.disposals: Dict[str, dict] = {}
         self.mining_results: Dict[Tuple[int, int, int], dict] = {}
         self.voice_ticks: Set[str] = set()
+        self.nodes: Dict[Tuple[int, str], dict] = {}
         self.down = False
         self.swing_down = False
         self._lose: Set[str] = set()
@@ -81,6 +83,9 @@ class LedgerModel:
         now = self.clock()
         return sum(1 for (gg, uu, _), r in self.mining_results.items() if (gg, uu) == (g, u) and r["t"] > now - 60)
 
+    def _node_now(self, n: dict) -> float:
+        return min(n["max_reserve"], n["reserve"] + n["regen_per_second"] * max(0.0, self.clock() - n["reserve_at"]))
+
     @staticmethod
     def _amount(value) -> Decimal:
         d = Decimal(str(value))
@@ -112,6 +117,26 @@ class LedgerModel:
         self._enter("load_held_items")
         with self.lock:
             return [copy.deepcopy(r) for r in self.items.values() if r["item_id"] not in self.disposals]
+
+    def load_production_policy(self) -> dict:
+        self._enter("load_production_policy")
+        with self.lock:
+            return {"scope": "global", **self.policy}
+
+    def register_nodes(self, g: int, nodes: Sequence[dict]) -> List[dict]:
+        self._enter("register_nodes")
+        with self.lock:
+            for n in nodes:
+                if float(n["max_reserve"]) <= 0 or float(n["regen_per_second"]) < 0:
+                    raise LedgerRejected("bad_nodes")
+            for n in nodes:
+                self.nodes.setdefault((g, n["node_id"]), {
+                    "max_reserve": float(n["max_reserve"]), "regen_per_second": float(n["regen_per_second"]),
+                    "reserve": float(n["max_reserve"]), "reserve_at": self.clock()})
+            rows = [{"node_id": nid, "reserve": self._node_now(n), "max_reserve": n["max_reserve"],
+                     "regen_per_second": n["regen_per_second"]}
+                    for (gg, nid), n in sorted(self.nodes.items()) if gg == g]
+            return self._exit("register_nodes", rows)
 
     def money_supply(self, g: int) -> Decimal:
         self._enter("money_supply")
@@ -148,26 +173,37 @@ class LedgerModel:
             self.counters[(g, u)] = self.counters.get((g, u), 0) + 1
             return self._exit("next_mining_attempt", self.counters[(g, u)])
 
-    def begin_swing(self, g: int, u: int) -> Tuple[int, float]:
+    def begin_swing(self, g: int, u: int, node_id: str, stamina_required: float) -> Tuple[int, float, float]:
         self._enter("begin_swing")
         if self.swing_down:
             raise ConnectionError("pencatat percobaan mati (simulasi)")
         with self.lock:
+            if stamina_required < 0:
+                raise LedgerRejected("bad_amount")
+            node = self.nodes.get((g, node_id))
+            if node is None:
+                raise LedgerRejected("unknown_node")
             p = self._player(g, u)
             limit = self.policy["max_swings_per_minute"]
             if limit is not None and self._swings_last_minute(g, u) >= limit:
                 raise LedgerRejected("rate_limited")
+            stamina = self._stamina_now(p)
+            if stamina + 1e-9 < stamina_required:
+                raise LedgerRejected("insufficient_stamina")
             self.counters[(g, u)] = self.counters.get((g, u), 0) + 1
-            return self._exit("begin_swing", (self.counters[(g, u)], self._stamina_now(p)))
+            return self._exit("begin_swing", (self.counters[(g, u)], stamina, self._node_now(node)))
 
     def record_swing(self, g: int, u: int, attempt: int, *, node_id: str, success: bool, critical_hit: bool,
                      amount_extracted: float, stamina_consumed: float, item_kind: Optional[str],
-                     item_uuid: Optional[str], item_payload: Optional[dict]) -> Tuple[float, Optional[str], bool]:
+                     item_uuid: Optional[str], item_payload: Optional[dict]
+                     ) -> Tuple[float, Optional[str], bool, Optional[float]]:
         self._enter("record_swing")
         with self.lock:
             prev = self.mining_results.get((g, u, attempt))
             if prev is not None:
-                return self._exit("record_swing", (prev["stamina_after"], prev["item_id"], True))
+                node = self.nodes.get((g, prev["node_id"]))
+                return self._exit("record_swing", (prev["stamina_after"], prev["item_id"], True,
+                                                   None if node is None else self._node_now(node)))
             if attempt < 1 or attempt > self.counters.get((g, u), 0):
                 raise LedgerRejected("attempt_not_issued")
             if stamina_consumed < 0 or amount_extracted < 0:
@@ -175,19 +211,27 @@ class LedgerModel:
             p = self.players.get((g, u))
             if p is None:
                 raise LedgerRejected("no_player")
+            node = self.nodes.get((g, node_id))
+            if node is None:
+                raise LedgerRejected("unknown_node")
             limit = self.policy["max_swings_per_minute"]
             if limit is not None and self._swings_last_minute(g, u) >= limit:
                 raise LedgerRejected("rate_limited")
             before = self._stamina_now(p)
             if stamina_consumed > before + 1e-9:
                 raise LedgerRejected("insufficient_stamina")
+            reserve = self._node_now(node)
+            if amount_extracted > reserve + 1e-4:          # = SQL: engine rounds to 4 decimals
+                raise LedgerRejected("node_depleted")
             item_id = None
             if item_payload is not None:
                 if item_kind not in ("ore", "crystal") or item_uuid is None:
                     raise LedgerRejected("bad_item")
                 item_id = f"swing:{g}:{u}:{attempt}"
             after = max(0.0, before - stamina_consumed)
+            reserve = max(0.0, reserve - amount_extracted)
             p["stamina"], p["stamina_at"] = after, self.clock()
+            node["reserve"], node["reserve_at"] = reserve, self.clock()
             if item_id is not None:
                 self.items[item_id] = {"item_id": item_id, "guild_id": g, "owner_id": u, "kind": item_kind,
                                        "item_uuid": item_uuid, "payload": json.loads(json.dumps(item_payload))}
@@ -196,7 +240,7 @@ class LedgerModel:
                 "amount_extracted": amount_extracted, "stamina_before": before,
                 "stamina_consumed": stamina_consumed, "stamina_after": after, "item_id": item_id, "t": self.clock(),
             }
-            return self._exit("record_swing", (after, item_id, False))
+            return self._exit("record_swing", (after, item_id, False, reserve))
 
     def sell_item(self, g: int, u: int, item_id: str, payout, kind: str) -> Tuple[Decimal, bool]:
         self._enter("sell_item")
@@ -244,16 +288,6 @@ class LedgerModel:
                      "voice_seconds": self.players[(g, uid)]["voice_seconds"], "applied": applied}
                     for uid, *_ in parsed if (g, uid) in self.players]
             return self._exit("apply_voice_tick", rows)
-
-    def rest_player(self, g: int, u: int) -> Tuple[float, float]:
-        self._enter("rest_player")
-        with self.lock:
-            if not self.policy["rest_enabled"]:
-                raise LedgerRejected("rest_disabled")
-            p = self._player(g, u)
-            before = self._stamina_now(p)
-            p["stamina"], p["stamina_at"] = self.policy["stamina_cap"], self.clock()
-            return self._exit("rest_player", (before, self.policy["stamina_cap"]))
 
     def set_player_prefs(self, g: int, u: int, pickaxe_key: Optional[str] = None,
                          automine: Optional[bool] = None) -> Tuple[str, bool]:

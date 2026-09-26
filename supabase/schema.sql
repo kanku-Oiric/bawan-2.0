@@ -466,83 +466,6 @@ begin
     return v_balance;
 end $$;
 
--- 9. RPC untuk bot
--- Ayunan tahap 1: batas ayunan → counter n naik (atomik) → stamina saat ini.
-create or replace function public.begin_swing(p_guild_id bigint, p_user_id bigint)
-returns table (attempt bigint, stamina double precision)
-language plpgsql volatile as $$
-#variable_conflict use_column
-declare v_policy public.production_policy%rowtype; v_player public.players%rowtype; v_n bigint;
-begin
-    select * into strict v_policy from public.production_policy where scope = 'global';
-    perform bawan_private.ensure_player(p_guild_id, p_user_id);
-    select * into strict v_player from public.players
-        where guild_id = p_guild_id and user_id = p_user_id for update;       -- serialkan per pemain
-    if v_policy.max_swings_per_minute is not null
-       and bawan_private.swings_last_minute(p_guild_id, p_user_id) >= v_policy.max_swings_per_minute then
-        raise exception 'bawan:rate_limited';
-    end if;
-    v_n := public.next_mining_attempt(p_guild_id, p_user_id);
-    return query select v_n, bawan_private.stamina_now(v_player.stamina, v_player.stamina_at);
-end $$;
-
--- Ayunan tahap 2: catat hasil (sekali per n) + stamina + barang, satu transaksi.
-create or replace function public.record_swing(
-    p_guild_id bigint, p_user_id bigint, p_attempt bigint, p_node_id text,
-    p_success boolean, p_critical_hit boolean, p_amount_extracted double precision,
-    p_stamina_consumed double precision,
-    p_item_kind text, p_item_uuid text, p_item_payload jsonb
-) returns table (stamina_after double precision, item_id text, already boolean)
-language plpgsql volatile as $$
-#variable_conflict use_column
-declare
-    v_policy public.production_policy%rowtype; v_player public.players%rowtype;
-    v_prev public.mining_results%rowtype; v_counter bigint;
-    v_before double precision; v_after double precision; v_item text;
-begin
-    select * into v_prev from public.mining_results r
-        where r.guild_id = p_guild_id and r.user_id = p_user_id and r.attempt = p_attempt;
-    if found then                                            -- retry setelah timeout: kembalikan yang tercatat
-        return query select v_prev.stamina_after, v_prev.item_id, true;
-        return;
-    end if;
-    select m.attempts into v_counter from public.mining_attempts m
-        where m.guild_id = p_guild_id and m.user_id = p_user_id;
-    if v_counter is null or p_attempt < 1 or p_attempt > v_counter then
-        raise exception 'bawan:attempt_not_issued';
-    end if;
-    if p_stamina_consumed is null or p_stamina_consumed < 0 or p_amount_extracted is null or p_amount_extracted < 0 then
-        raise exception 'bawan:bad_amount';
-    end if;
-    select * into strict v_policy from public.production_policy where scope = 'global';
-    select * into strict v_player from public.players
-        where guild_id = p_guild_id and user_id = p_user_id for update;
-    if v_policy.max_swings_per_minute is not null
-       and bawan_private.swings_last_minute(p_guild_id, p_user_id) >= v_policy.max_swings_per_minute then
-        raise exception 'bawan:rate_limited';
-    end if;
-    v_before := bawan_private.stamina_now(v_player.stamina, v_player.stamina_at);
-    if p_stamina_consumed > v_before + 1e-9 then
-        raise exception 'bawan:insufficient_stamina';
-    end if;
-    v_after := greatest(0, v_before - p_stamina_consumed);
-    update public.players set stamina = v_after, stamina_at = now(), updated_at = now()
-        where guild_id = p_guild_id and user_id = p_user_id;
-    if p_item_payload is not null then
-        if p_item_kind not in ('ore', 'crystal') or p_item_uuid is null then
-            raise exception 'bawan:bad_item';
-        end if;
-        v_item := 'swing:' || p_guild_id || ':' || p_user_id || ':' || p_attempt;
-        insert into public.items (item_id, guild_id, owner_id, kind, item_uuid, payload)
-            values (v_item, p_guild_id, p_user_id, p_item_kind, p_item_uuid, p_item_payload);
-    end if;
-    insert into public.mining_results (guild_id, user_id, attempt, node_id, success, critical_hit,
-                                       amount_extracted, stamina_before, stamina_consumed, stamina_after, item_id)
-        values (p_guild_id, p_user_id, p_attempt, p_node_id, p_success, p_critical_hit,
-                p_amount_extracted, v_before, p_stamina_consumed, v_after, v_item);
-    return query select v_after, v_item, false;
-end $$;
-
 -- Jual barang ke NPC: kunci barang → pelepasan + ledger + wallet, satu transaksi.
 create or replace function public.sell_item(
     p_guild_id bigint, p_user_id bigint, p_item_id text, p_payout numeric, p_kind text
@@ -607,23 +530,6 @@ begin
         from public.players p
         where p.guild_id = p_guild_id
           and p.user_id in (select (x ->> 'user_id')::bigint from jsonb_array_elements(p_entries) x);
-end $$;
-
--- /rest (selama production_policy.rest_enabled): stamina = cap
-create or replace function public.rest_player(p_guild_id bigint, p_user_id bigint)
-returns table (stamina_before double precision, stamina double precision)
-language plpgsql volatile as $$
-#variable_conflict use_column
-declare v_policy public.production_policy%rowtype; v_player public.players%rowtype;
-begin
-    select * into strict v_policy from public.production_policy where scope = 'global';
-    if not v_policy.rest_enabled then raise exception 'bawan:rest_disabled'; end if;
-    perform bawan_private.ensure_player(p_guild_id, p_user_id);
-    select * into strict v_player from public.players
-        where guild_id = p_guild_id and user_id = p_user_id for update;
-    update public.players set stamina = v_policy.stamina_cap, stamina_at = now(), updated_at = now()
-        where guild_id = p_guild_id and user_id = p_user_id;
-    return query select bawan_private.stamina_now(v_player.stamina, v_player.stamina_at), v_policy.stamina_cap;
 end $$;
 
 -- Preferensi (bukan uang): pickaxe terakhir, status auto mine.  NULL = tidak diubah.
@@ -707,14 +613,217 @@ begin
         'bawan_private.ensure_player(bigint, bigint)',
         'bawan_private.swings_last_minute(bigint, bigint)',
         'bawan_private.ledger_post(text, bigint, bigint, text, numeric, text)',
-        'public.begin_swing(bigint, bigint)',
-        'public.record_swing(bigint, bigint, bigint, text, boolean, boolean, double precision, double precision, text, text, jsonb)',
         'public.sell_item(bigint, bigint, text, numeric, text)',
         'public.apply_voice_tick(bigint, text, jsonb)',
-        'public.rest_player(bigint, bigint)',
         'public.set_player_prefs(bigint, bigint, text, boolean)',
         'public.money_supply(bigint)',
         'public.ledger_audit()'
+    ] loop
+        execute format('revoke all on function %s from public, anon, authenticated', f);
+        execute format('grant execute on function %s to service_role', f);
+    end loop;
+end $$;
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- v8: CADANGAN NODE DI DB + BATAS PRODUKSI (tanpa /rest)
+--   • node_state: cadangan tiap node.  Regen dihitung dari jam DB saat dibaca
+--     (reserve_now = min(max, reserve + regen × Δt)), bukan tick di memori
+--     bot — restart tidak lagi mengisi ulang node.
+--   • Cadangan hanya bisa BERKURANG dan hanya di dalam record_swing (trigger
+--     menolak jalur lain).  max_reserve/regen dikunci saat node didaftarkan.
+--   • Stamina pulih dari waktu saja: rest_player DIHAPUS.
+--   • Angka awal kebijakan (bisa diubah dengan UPDATE, skema tetap):
+--       stamina_cap 100 · regen 50/jam (penuh 2 jam) · maks 6 ayunan/menit
+--     Diterapkan SEKALI (hanya selama rest_enabled masih true dari v7), jadi
+--     menjalankan ulang file ini tidak menimpa angka yang sudah disetel.
+-- ════════════════════════════════════════════════════════════════════════════
+create table if not exists public.node_state (
+    guild_id          bigint           not null,
+    node_id           text             not null check (length(node_id) between 1 and 200),
+    max_reserve       double precision not null check (max_reserve > 0),
+    regen_per_second  double precision not null check (regen_per_second >= 0),
+    reserve           double precision not null check (reserve >= 0),
+    reserve_at        timestamptz      not null default now(),
+    registered_at     timestamptz      not null default now(),
+    primary key (guild_id, node_id),
+    constraint node_state_reserve_within_max check (reserve <= max_reserve)
+);
+
+create or replace function bawan_private.guard_node() returns trigger
+language plpgsql as $$
+begin
+    if TG_OP = 'DELETE' then
+        raise exception 'bawan:node_delete_forbidden';
+    end if;
+    if new.guild_id <> old.guild_id or new.node_id <> old.node_id or new.max_reserve <> old.max_reserve
+       or new.regen_per_second <> old.regen_per_second or new.registered_at <> old.registered_at then
+        raise exception 'bawan:node_params_locked';
+    end if;
+    if coalesce(current_setting('bawan.node', true), '') <> 'on' then
+        raise exception 'bawan:node_outside_swing';
+    end if;
+    return new;
+end $$;
+drop trigger if exists node_state_guard on public.node_state;
+create trigger node_state_guard before update or delete on public.node_state
+    for each row execute function bawan_private.guard_node();
+drop trigger if exists node_state_no_truncate on public.node_state;
+create trigger node_state_no_truncate before truncate on public.node_state
+    for each statement execute function public.forbid_mutation();
+
+create or replace function bawan_private.node_reserve_now(
+    p_reserve double precision, p_at timestamptz, p_max double precision, p_regen double precision
+) returns double precision language sql stable as $$
+    select least(p_max, p_reserve + p_regen * greatest(0, extract(epoch from (now() - p_at)))::double precision)
+$$;
+
+-- Daftarkan node (insert-or-ignore; parameter lama TIDAK ditimpa) lalu kembalikan
+-- SEMUA node guild itu dengan cadangan saat ini.  p_nodes = [] → hanya membaca.
+create or replace function public.register_nodes(p_guild_id bigint, p_nodes jsonb)
+returns table (node_id text, reserve double precision, max_reserve double precision, regen_per_second double precision)
+language plpgsql volatile as $$
+#variable_conflict use_column
+begin
+    if jsonb_typeof(p_nodes) <> 'array' then raise exception 'bawan:bad_nodes'; end if;
+    insert into public.node_state (guild_id, node_id, max_reserve, regen_per_second, reserve)
+    select p_guild_id, n ->> 'node_id', (n ->> 'max_reserve')::double precision,
+           (n ->> 'regen_per_second')::double precision, (n ->> 'max_reserve')::double precision
+    from jsonb_array_elements(p_nodes) n
+    on conflict on constraint node_state_pkey do nothing;     -- nama constraint: kolom output = nama kolom tabel
+    return query
+        select s.node_id, bawan_private.node_reserve_now(s.reserve, s.reserve_at, s.max_reserve, s.regen_per_second),
+               s.max_reserve, s.regen_per_second
+        from public.node_state s where s.guild_id = p_guild_id
+        order by s.node_id;
+end $$;
+
+-- begin_swing v8: + node & stamina minimum.  Kurang stamina → ditolak SEBELUM
+-- counter naik (tidak ada nomor percobaan yang terbuang).
+drop function if exists public.begin_swing(bigint, bigint);
+create or replace function public.begin_swing(
+    p_guild_id bigint, p_user_id bigint, p_node_id text, p_stamina_required double precision
+) returns table (attempt bigint, stamina double precision, node_reserve double precision)
+language plpgsql volatile as $$
+#variable_conflict use_column
+declare
+    v_policy public.production_policy%rowtype; v_player public.players%rowtype;
+    v_node public.node_state%rowtype; v_stamina double precision; v_n bigint;
+begin
+    if p_stamina_required is null or p_stamina_required < 0 then raise exception 'bawan:bad_amount'; end if;
+    select * into strict v_policy from public.production_policy where scope = 'global';
+    select * into v_node from public.node_state s where s.guild_id = p_guild_id and s.node_id = p_node_id;
+    if not found then raise exception 'bawan:unknown_node'; end if;
+    perform bawan_private.ensure_player(p_guild_id, p_user_id);
+    select * into strict v_player from public.players
+        where guild_id = p_guild_id and user_id = p_user_id for update;       -- serialkan per pemain
+    if v_policy.max_swings_per_minute is not null
+       and bawan_private.swings_last_minute(p_guild_id, p_user_id) >= v_policy.max_swings_per_minute then
+        raise exception 'bawan:rate_limited';
+    end if;
+    v_stamina := bawan_private.stamina_now(v_player.stamina, v_player.stamina_at);
+    if v_stamina + 1e-9 < p_stamina_required then
+        raise exception 'bawan:insufficient_stamina';
+    end if;
+    v_n := public.next_mining_attempt(p_guild_id, p_user_id);
+    return query select v_n, v_stamina,
+        bawan_private.node_reserve_now(v_node.reserve, v_node.reserve_at, v_node.max_reserve, v_node.regen_per_second);
+end $$;
+
+-- record_swing v8: + cadangan node berkurang di transaksi yang sama.
+drop function if exists public.record_swing(bigint, bigint, bigint, text, boolean, boolean, double precision,
+                                            double precision, text, text, jsonb);
+create or replace function public.record_swing(
+    p_guild_id bigint, p_user_id bigint, p_attempt bigint, p_node_id text,
+    p_success boolean, p_critical_hit boolean, p_amount_extracted double precision,
+    p_stamina_consumed double precision,
+    p_item_kind text, p_item_uuid text, p_item_payload jsonb
+) returns table (stamina_after double precision, item_id text, already boolean, node_reserve double precision)
+language plpgsql volatile as $$
+#variable_conflict use_column
+declare
+    v_policy public.production_policy%rowtype; v_player public.players%rowtype; v_node public.node_state%rowtype;
+    v_prev public.mining_results%rowtype; v_counter bigint;
+    v_before double precision; v_after double precision; v_item text; v_reserve double precision;
+begin
+    select * into v_prev from public.mining_results r
+        where r.guild_id = p_guild_id and r.user_id = p_user_id and r.attempt = p_attempt;
+    if found then                                            -- retry setelah timeout: kembalikan yang tercatat
+        select * into v_node from public.node_state s where s.guild_id = p_guild_id and s.node_id = v_prev.node_id;
+        return query select v_prev.stamina_after, v_prev.item_id, true,
+            bawan_private.node_reserve_now(v_node.reserve, v_node.reserve_at, v_node.max_reserve, v_node.regen_per_second);
+        return;
+    end if;
+    select m.attempts into v_counter from public.mining_attempts m
+        where m.guild_id = p_guild_id and m.user_id = p_user_id;
+    if v_counter is null or p_attempt < 1 or p_attempt > v_counter then
+        raise exception 'bawan:attempt_not_issued';
+    end if;
+    if p_stamina_consumed is null or p_stamina_consumed < 0 or p_amount_extracted is null or p_amount_extracted < 0 then
+        raise exception 'bawan:bad_amount';
+    end if;
+    select * into strict v_policy from public.production_policy where scope = 'global';
+    select * into strict v_player from public.players
+        where guild_id = p_guild_id and user_id = p_user_id for update;         -- kunci: pemain → node
+    select * into v_node from public.node_state s
+        where s.guild_id = p_guild_id and s.node_id = p_node_id for update;
+    if not found then raise exception 'bawan:unknown_node'; end if;
+    if v_policy.max_swings_per_minute is not null
+       and bawan_private.swings_last_minute(p_guild_id, p_user_id) >= v_policy.max_swings_per_minute then
+        raise exception 'bawan:rate_limited';
+    end if;
+    v_before := bawan_private.stamina_now(v_player.stamina, v_player.stamina_at);
+    if p_stamina_consumed > v_before + 1e-9 then
+        raise exception 'bawan:insufficient_stamina';
+    end if;
+    v_reserve := bawan_private.node_reserve_now(v_node.reserve, v_node.reserve_at, v_node.max_reserve, v_node.regen_per_second);
+    -- MiningEngine membulatkan hasil ke 4 desimal; cadangan disimpan 6 desimal.
+    -- Mengambil seluruh sisa node bisa membulat NAIK ≤ 5e-5 → toleransi 1e-4.
+    if p_amount_extracted > v_reserve + 1e-4 then
+        raise exception 'bawan:node_depleted';
+    end if;
+    v_after   := greatest(0, v_before - p_stamina_consumed);
+    v_reserve := greatest(0, v_reserve - p_amount_extracted);
+    update public.players set stamina = v_after, stamina_at = now(), updated_at = now()
+        where guild_id = p_guild_id and user_id = p_user_id;
+    perform set_config('bawan.node', 'on', true);
+    update public.node_state s set reserve = v_reserve, reserve_at = now()
+        where s.guild_id = p_guild_id and s.node_id = p_node_id;
+    perform set_config('bawan.node', 'off', true);
+    if p_item_payload is not null then
+        if p_item_kind not in ('ore', 'crystal') or p_item_uuid is null then
+            raise exception 'bawan:bad_item';
+        end if;
+        v_item := 'swing:' || p_guild_id || ':' || p_user_id || ':' || p_attempt;
+        insert into public.items (item_id, guild_id, owner_id, kind, item_uuid, payload)
+            values (v_item, p_guild_id, p_user_id, p_item_kind, p_item_uuid, p_item_payload);
+    end if;
+    insert into public.mining_results (guild_id, user_id, attempt, node_id, success, critical_hit,
+                                       amount_extracted, stamina_before, stamina_consumed, stamina_after, item_id)
+        values (p_guild_id, p_user_id, p_attempt, p_node_id, p_success, p_critical_hit,
+                p_amount_extracted, v_before, p_stamina_consumed, v_after, v_item);
+    return query select v_after, v_item, false, v_reserve;
+end $$;
+
+-- /rest DIHAPUS: stamina hanya pulih dari waktu.
+drop function if exists public.rest_player(bigint, bigint);
+
+-- Angka awal kebijakan produksi — sekali saja (lihat header v8).
+update public.production_policy
+    set stamina_cap = 100, stamina_regen_per_second = 50.0 / 3600, max_swings_per_minute = 6,
+        rest_enabled = false, updated_at = now()
+    where scope = 'global' and rest_enabled;
+
+alter table public.node_state enable row level security;
+revoke all on table public.node_state from anon, authenticated;
+do $$
+declare f text;
+begin
+    foreach f in array array[
+        'bawan_private.guard_node()',
+        'bawan_private.node_reserve_now(double precision, timestamptz, double precision, double precision)',
+        'public.register_nodes(bigint, jsonb)',
+        'public.begin_swing(bigint, bigint, text, double precision)',
+        'public.record_swing(bigint, bigint, bigint, text, boolean, boolean, double precision, double precision, text, text, jsonb)'
     ] loop
         execute format('revoke all on function %s from public, anon, authenticated', f);
         execute format('grant execute on function %s to service_role', f);
