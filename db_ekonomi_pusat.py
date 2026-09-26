@@ -5,7 +5,9 @@
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  TABEL (lihat supabase/schema.sql)                                           ║
 ║  ─────────────────────────────────────────────────────────────────────────  ║
-║  players       (guild_id, user_id) → wallet, xp, level, voice, bag, ...    ║
+║  players       (guild_id, user_id) → wallet, stamina, xp, level, voice     ║
+║  ledger / items / item_disposals / mining_results / voice_ticks            ║
+║                → saldo otoritatif (v7): SEMUA perubahan lewat RPC          ║
 ║  currencies    guild_id → CurrencyManifest dari currency_engine.py         ║
 ║  voice_config  guild_id → VoiceConfig dari voice_engine.py                 ║
 ║  server_registry / world_nonces  → Stage 0 (insert-only, world_registry)   ║
@@ -24,8 +26,10 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from datetime import datetime, timezone
-from typing import Dict, List, Mapping, Optional, Sequence, Set
+from decimal import ROUND_HALF_EVEN, Decimal
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 from supabase import Client, create_client
@@ -42,14 +46,17 @@ TABLE_WORLD_NONCES: str = "world_nonces"
 TABLE_WORLD_COMMITMENTS: str = "world_commitments"
 TABLE_WORLD_WITNESS_LOG: str = "world_witness_log"
 TABLE_MINING_ATTEMPTS: str = "mining_attempts"
+TABLE_LEDGER: str = "ledger"
+TABLE_ITEMS: str = "items"
+TABLE_ITEM_DISPOSALS: str = "item_disposals"
+TABLE_MINING_RESULTS: str = "mining_results"
+TABLE_VOICE_TICKS: str = "voice_ticks"
+TABLE_PRODUCTION_POLICY: str = "production_policy"
 
 # Kolom yang WAJIB ada; dicek saat startup supaya migrasi yang terlewat
 # langsung ketahuan, bukan gagal diam-diam di setiap flush.
 _REQUIRED_COLUMNS = {
-    TABLE_PLAYERS: (
-        "guild_id,user_id,stamina,pickaxe_key,wallet,xp,level,voice_seconds,"
-        "ore_bag,crystal_bag,automine"
-    ),
+    TABLE_PLAYERS: "guild_id,user_id,stamina,stamina_at,pickaxe_key,wallet,xp,level,voice_seconds,automine",
     TABLE_CURRENCIES: (
         "guild_id,currency_name,ticker,genesis_market_cap,total_supply,circulating_supply,"
         "reserve_supply,exchange_rate_to_ua,geological_backing_value_ua,policy,"
@@ -64,11 +71,51 @@ _REQUIRED_COLUMNS = {
     TABLE_WORLD_COMMITMENTS: "algo_version,pepper_commitment,committed_at",
     TABLE_WORLD_WITNESS_LOG: "event_key,event_id,delivered_at",
     TABLE_MINING_ATTEMPTS: "guild_id,user_id,attempts,updated_at",
+    TABLE_LEDGER: "id,ref,guild_id,user_id,kind,amount,balance_after,item_id,created_at",
+    TABLE_ITEMS: "item_id,guild_id,owner_id,kind,item_uuid,payload,created_at",
+    TABLE_ITEM_DISPOSALS: "item_id,kind,ledger_ref,created_at",
+    TABLE_MINING_RESULTS: (
+        "guild_id,user_id,attempt,node_id,success,critical_hit,amount_extracted,"
+        "stamina_before,stamina_consumed,stamina_after,item_id,created_at"
+    ),
+    TABLE_VOICE_TICKS: "ref,guild_id,created_at",
+    TABLE_PRODUCTION_POLICY: "scope,stamina_cap,stamina_regen_per_second,max_swings_per_minute,rest_enabled",
 }
+
+# wallet dibaca sebagai teks → Decimal: numeric(24,4) tidak lewat float.
+_PLAYER_COLUMNS: str = (
+    "guild_id,user_id,stamina,stamina_at,pickaxe_key,wallet::text,xp,level,voice_seconds,automine"
+)
+
+MONEY_QUANTUM: Decimal = Decimal("0.0001")          # = numeric(24,4)
+
+
+def money_str(value: object) -> str:
+    """Jumlah uang → string 4 desimal untuk RPC.  Menolak negatif/NaN/inf."""
+    d = value if isinstance(value, Decimal) else Decimal(str(value))
+    if not d.is_finite() or d < 0:
+        raise ValueError(f"jumlah uang tidak sah: {value!r}")
+    return str(d.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_EVEN))
+
+
+def parse_money(value: object) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise NotSupabaseResponse(f"nilai uang bukan teks/angka: {type(value).__name__}. {_URL_HINT}")
+    return Decimal(str(value))
+
+
+_REJECT_CODE = re.compile(r"bawan:([a-z_]+)")
+
+
+class LedgerRejected(Exception):
+    """Aturan database menolak operasi (bukan gangguan jaringan).  `.code` = kode `bawan:<code>`."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(code if not detail else f"{code} ({detail})")
+        self.code = code
 
 # PostgREST membatasi 1000 baris per response secara default.
 _PAGE_SIZE: int = 1000
-_UPSERT_CHUNK: int = 500
 
 
 def _utc_now_iso() -> str:
@@ -210,11 +257,11 @@ class EconomyDatabase:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _select_all(self, table: str, order_by: Sequence[str]) -> List[dict]:
+    def _select_all(self, table: str, order_by: Sequence[str], columns: str = "*") -> List[dict]:
         rows: List[dict] = []
         start = 0
         while True:
-            query = self._db.table(table).select("*")
+            query = self._db.table(table).select(columns)
             for col in order_by:
                 query = query.order(col)
             # _rows() also stops a non-API endpoint from looping forever here
@@ -224,6 +271,24 @@ class EconomyDatabase:
             if len(page) < _PAGE_SIZE:
                 return rows
             start += _PAGE_SIZE
+
+    def _rpc(self, name: str, params: dict) -> object:
+        """RPC; a rule violation raised by the DB (`bawan:<code>`) becomes LedgerRejected."""
+        try:
+            return self._db.rpc(name, params).execute().data
+        except NotSupabaseResponse:
+            raise
+        except Exception as exc:
+            match = _REJECT_CODE.search(str(exc))
+            if match:
+                raise LedgerRejected(match.group(1), str(exc)[:300]) from exc
+            raise
+
+    def _rpc_row(self, name: str, params: dict) -> dict:
+        rows = _rows(self._rpc(name, params), f"rpc {name}")
+        if len(rows) != 1:
+            raise NotSupabaseResponse(f"rpc {name}: harus 1 baris, dapat {len(rows)}. {_URL_HINT}")
+        return rows[0]
 
     # ── Startup check ─────────────────────────────────────────────────────────
 
@@ -242,18 +307,84 @@ class EconomyDatabase:
                     f"adalah key service_role / secret."
                 ) from exc
 
-    # ── Players ───────────────────────────────────────────────────────────────
+    # ── Players (read-only here: every write goes through an RPC below) ───────
 
     def load_player_rows(self) -> List[dict]:
-        return self._select_all(TABLE_PLAYERS, ("guild_id", "user_id"))
+        rows = self._select_all(TABLE_PLAYERS, ("guild_id", "user_id"), columns=_PLAYER_COLUMNS)
+        for row in rows:
+            row["wallet"] = parse_money(row["wallet"])
+        return rows
 
-    def upsert_player_rows(self, rows: Sequence[dict]) -> None:
-        stamp = _utc_now_iso()
-        payload = [{**row, "updated_at": stamp} for row in rows]
-        for i in range(0, len(payload), _UPSERT_CHUNK):
-            self._db.table(TABLE_PLAYERS).upsert(
-                payload[i:i + _UPSERT_CHUNK], on_conflict="guild_id,user_id"
-            ).execute()
+    def load_held_items(self) -> List[dict]:
+        """Barang yang belum dilepas (items − item_disposals), urut waktu dibuat."""
+        disposed = {r["item_id"] for r in self._select_all(TABLE_ITEM_DISPOSALS, ("item_id",), columns="item_id")}
+        return [r for r in self._select_all(TABLE_ITEMS, ("created_at", "item_id")) if r["item_id"] not in disposed]
+
+    # ── Saldo otoritatif (schema v7) — satu RPC = satu transaksi ─────────────
+
+    def begin_swing(self, guild_id: int, user_id: int) -> Tuple[int, float]:
+        """Rate limit → counter n naik atomik → (n, stamina saat ini menurut jam DB)."""
+        row = self._rpc_row("begin_swing", {"p_guild_id": guild_id, "p_user_id": user_id})
+        attempt, stamina = row.get("attempt"), row.get("stamina")
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1 \
+                or not isinstance(stamina, (int, float)) or isinstance(stamina, bool):
+            raise NotSupabaseResponse(f"rpc begin_swing: respons tidak valid {row!r}. {_URL_HINT}")
+        return attempt, float(stamina)
+
+    def record_swing(
+        self, guild_id: int, user_id: int, attempt: int, *, node_id: str, success: bool,
+        critical_hit: bool, amount_extracted: float, stamina_consumed: float,
+        item_kind: Optional[str], item_uuid: Optional[str], item_payload: Optional[dict],
+    ) -> Tuple[float, Optional[str], bool]:
+        """Catat hasil ayunan n sekali.  Returns (stamina_after, item_id|None, already)."""
+        row = self._rpc_row("record_swing", {
+            "p_guild_id": guild_id, "p_user_id": user_id, "p_attempt": attempt, "p_node_id": node_id,
+            "p_success": success, "p_critical_hit": critical_hit,
+            "p_amount_extracted": float(amount_extracted), "p_stamina_consumed": float(stamina_consumed),
+            "p_item_kind": item_kind, "p_item_uuid": item_uuid, "p_item_payload": item_payload,
+        })
+        return float(row["stamina_after"]), row["item_id"], bool(row["already"])
+
+    def sell_item(self, guild_id: int, user_id: int, item_id: str, payout: object, kind: str) -> Tuple[Decimal, bool]:
+        """Jual satu barang (sekali saja).  Returns (saldo baru, already=penjualan yang sama di-retry)."""
+        row = self._rpc_row("sell_item", {
+            "p_guild_id": guild_id, "p_user_id": user_id, "p_item_id": item_id,
+            "p_payout": money_str(payout), "p_kind": kind,
+        })
+        return parse_money(row["balance"]), bool(row["already"])
+
+    def apply_voice_tick(self, guild_id: int, ref: str, entries: Sequence[dict]) -> List[dict]:
+        """entries: [{user_id, coin, xp, voice_seconds}] → baris terbaru tiap user (+applied)."""
+        payload = [{
+            "user_id": int(e["user_id"]), "coin": money_str(e.get("coin", 0)),
+            "xp": int(e.get("xp", 0)), "voice_seconds": float(e.get("voice_seconds", 0.0)),
+        } for e in entries]
+        rows = _rows(self._rpc("apply_voice_tick", {"p_guild_id": guild_id, "p_ref": ref, "p_entries": payload}),
+                     "rpc apply_voice_tick")
+        for row in rows:
+            row["wallet"] = parse_money(row["wallet"])
+        return rows
+
+    def rest_player(self, guild_id: int, user_id: int) -> Tuple[float, float]:
+        row = self._rpc_row("rest_player", {"p_guild_id": guild_id, "p_user_id": user_id})
+        return float(row["stamina_before"]), float(row["stamina"])
+
+    def set_player_prefs(self, guild_id: int, user_id: int, pickaxe_key: Optional[str] = None,
+                         automine: Optional[bool] = None) -> Tuple[str, bool]:
+        row = self._rpc_row("set_player_prefs", {
+            "p_guild_id": guild_id, "p_user_id": user_id, "p_pickaxe_key": pickaxe_key, "p_automine": automine,
+        })
+        return row["pickaxe_key"], bool(row["automine"])
+
+    def money_supply(self, guild_id: int) -> Decimal:
+        """Uang beredar = jumlah saldo di DB.  Satu-satunya sumber M."""
+        return parse_money(self._rpc("money_supply", {"p_guild_id": guild_id}))
+
+    def ledger_audit(self) -> dict:
+        data = self._rpc("ledger_audit", {})
+        if not isinstance(data, dict) or "wallet_mismatch" not in data:
+            raise NotSupabaseResponse(f"rpc ledger_audit: respons bukan dari API Supabase. {_URL_HINT}")
+        return data
 
     # ── Currencies ────────────────────────────────────────────────────────────
 
@@ -463,7 +594,7 @@ if __name__ == "__main__":
             fail(str(exc))
         raw = gw._db
 
-        print("\n[live] Supabase TES (baris uji guild_id=0, dihapus di akhir)")
+        print("\n[live] Supabase TES (currency/voice_config guild_id=0, dihapus di akhir)")
         try:
             gw.verify_schema()
             check("verify_schema", True, True)
@@ -477,23 +608,131 @@ if __name__ == "__main__":
             gw.upsert_voice_config(vcfg)
             check("voice_config round-trip", gw.load_voice_configs().get(TEST_GUILD), vcfg)
 
-            player_row = {
-                "guild_id": TEST_GUILD, "user_id": 42, "stamina": 55.5, "pickaxe_key": "iron_standard",
-                "wallet": 123.4567, "xp": 250, "level": 2, "voice_seconds": 901.25,
-                "ore_bag": [{"item_uuid": "abc", "owner_id": 42, "server_id": 1234567890123456789}],
-                "crystal_bag": [], "automine": True,
-            }
-            gw.upsert_player_rows([player_row])
-            gw.upsert_player_rows([{**player_row, "wallet": 200.0}])          # update, bukan duplikat
-            mine = [r for r in gw.load_player_rows() if r["guild_id"] == TEST_GUILD]
-            check("player: tepat 1 baris setelah 2x upsert", len(mine), 1)
-            check("player: wallet ter-update", float(mine[0]["wallet"]), 200.0)
-            check("player: snowflake di jsonb utuh", mine[0]["ore_bag"][0]["server_id"], 1234567890123456789)
-            check("player: status automine tersimpan", mine[0]["automine"], True)
+            print("\n[live] Saldo otoritatif (v7) — sentinel guild -2, PERMANEN (ledger insert-only)")
+            import time as _time
+            from concurrent.futures import ThreadPoolExecutor
+            from voice_engine import level_for_xp
+
+            LG = -2
+            run = _time.time_ns() // 1000 % 10**12          # user baru tiap run → state bersih
+            U, U2, U3 = run, run + 1, run + 2
+
+            def rejected(label: str, code: str, fn) -> None:
+                try:
+                    fn()
+                    check(label, "diterima", code)
+                except LedgerRejected as exc:
+                    check(label, exc.code, code)
+                except Exception as exc:
+                    check(label, f"error lain: {str(exc)[:160]}", code)
+
+            def refused(label: str, needle: str, fn) -> None:
+                try:
+                    fn()
+                    check(label, "diterima", "ditolak")
+                except Exception as exc:
+                    check(label, "ditolak" if needle in str(exc) else f"error lain: {str(exc)[:160]}", "ditolak")
+
+            payload = {"item_uuid": "ab" * 32, "element_symbol": "Fe", "purity": "Crude", "weight_tonnes": 1.5}
+            n1, st1 = gw.begin_swing(LG, U)
+            check("begin_swing: n pertama = 1, stamina = cap 100", (n1, st1), (1, 100.0))
+            after, item_id, again = gw.record_swing(
+                LG, U, n1, node_id="test:Fe:0", success=True, critical_hit=False, amount_extracted=1.5,
+                stamina_consumed=10.0, item_kind="ore", item_uuid=payload["item_uuid"], item_payload=payload)
+            check("record_swing: stamina berkurang, barang tercatat", (after, item_id, again),
+                  (90.0, f"swing:{LG}:{U}:{n1}", False))
+            check("record_swing di-retry → hasil yang sama, tidak dobel",
+                  gw.record_swing(LG, U, n1, node_id="test:Fe:0", success=True, critical_hit=False,
+                                  amount_extracted=1.5, stamina_consumed=10.0, item_kind="ore",
+                                  item_uuid=payload["item_uuid"], item_payload=payload),
+                  (90.0, item_id, True))
+            rejected("record_swing untuk n yang belum dikeluarkan counter", "attempt_not_issued",
+                     lambda: gw.record_swing(LG, U, n1 + 5, node_id="x", success=False, critical_hit=False,
+                                             amount_extracted=0, stamina_consumed=0, item_kind=None,
+                                             item_uuid=None, item_payload=None))
+            n2, _ = gw.begin_swing(LG, U)
+            rejected("record_swing dengan stamina tidak cukup", "insufficient_stamina",
+                     lambda: gw.record_swing(LG, U, n2, node_id="x", success=True, critical_hit=False,
+                                             amount_extracted=0, stamina_consumed=1000, item_kind=None,
+                                             item_uuid=None, item_payload=None))
+            check("rest_player → stamina = cap", gw.rest_player(LG, U), (90.0, 100.0))
+            check("set_player_prefs tersimpan", gw.set_player_prefs(LG, U, pickaxe_key="iron_standard", automine=True),
+                  ("iron_standard", True))
+
+            def sell_on_own_connection(_):
+                own = EconomyDatabase(connect_test_database(os.environ))
+                return own.sell_item(LG, U, item_id, "12.3456", "sell_ore")
+
+            with ThreadPoolExecutor(max_workers=50) as pool:
+                sales = list(pool.map(sell_on_own_connection, range(50)))
+            check("50 penjualan paralel barang yang sama → tepat 1 yang berhasil",
+                  sum(1 for _, already in sales if not already), 1)
+            check("… dan semua 50 melihat saldo akhir yang sama (12.3456)",
+                  {str(balance) for balance, _ in sales}, {"12.3456"})
+            ledger_rows = _rows(raw.table(TABLE_LEDGER).select("ref").eq("ref", f"sell:{item_id}").execute().data, "ledger")
+            check("… dan tepat 1 baris ledger untuk penjualan itu", len(ledger_rows), 1)
+            rejected("jual barang milik orang lain", "item_not_owned",
+                     lambda: gw.sell_item(LG, U2, item_id, "1", "sell_ore"))
+
+            ref = f"voice:test:{run}"
+            first = gw.apply_voice_tick(LG, ref, [{"user_id": U, "coin": "2.5", "xp": 150, "voice_seconds": 61.0}])
+            second = gw.apply_voice_tick(LG, ref, [{"user_id": U, "coin": "2.5", "xp": 150, "voice_seconds": 61.0}])
+            check("voice tick: diterapkan sekali, retry ref sama tidak dobel",
+                  ([r["applied"] for r in first], [r["applied"] for r in second]), ([True], [False]))
+            check("voice tick: wallet/xp/level/detik ditambah tepat sekali",
+                  (str(second[0]["wallet"]), second[0]["xp"], second[0]["level"], second[0]["voice_seconds"]),
+                  ("14.8456", 150, 2, 61.0))
+            levels_ok = True
+            cumulative = 0
+            for i, delta in enumerate((99, 1, 299, 1, 999_600, 1, 7)):
+                cumulative += delta
+                row = gw.apply_voice_tick(LG, f"voice:level:{run}:{i}",
+                                          [{"user_id": U3, "coin": "0", "xp": delta, "voice_seconds": 0}])[0]
+                levels_ok &= (row["xp"], row["level"]) == (cumulative, level_for_xp(cumulative))
+            check("level di SQL = voice_engine.level_for_xp (batas 99/100/399/400/10⁶)", levels_ok, True)
+
+            refused("UPDATE wallet langsung (service_role) ditolak", "wallet_outside_ledger",
+                    lambda: raw.table(TABLE_PLAYERS).update({"wallet": "999"}).eq("guild_id", LG).eq("user_id", U).execute())
+            refused("INSERT pemain dengan saldo langsung ditolak", "wallet_outside_ledger",
+                    lambda: raw.table(TABLE_PLAYERS).insert({"guild_id": LG, "user_id": run + 9, "wallet": "5"}).execute())
+            refused("DELETE pemain ditolak", "players_delete_forbidden",
+                    lambda: raw.table(TABLE_PLAYERS).delete().eq("guild_id", LG).eq("user_id", U).execute())
+            refused("UPDATE ledger ditolak", "insert-only",
+                    lambda: raw.table(TABLE_LEDGER).update({"amount": "1000"}).eq("ref", f"sell:{item_id}").execute())
+            refused("DELETE ledger ditolak", "insert-only",
+                    lambda: raw.table(TABLE_LEDGER).delete().eq("ref", f"sell:{item_id}").execute())
+            refused("DELETE item_disposals ditolak (barang tidak bisa 'dibatalkan jual')", "insert-only",
+                    lambda: raw.table(TABLE_ITEM_DISPOSALS).delete().eq("item_id", item_id).execute())
+            rejected("payout negatif ditolak di DB", "bad_amount",
+                     lambda: gw._rpc("sell_item", {"p_guild_id": LG, "p_user_id": U, "p_item_id": item_id,
+                                                   "p_payout": "-1", "p_kind": "sell_ore"}))
+            rejected("koin voice negatif ditolak di DB", "bad_amount",
+                     lambda: gw._rpc("apply_voice_tick", {"p_guild_id": LG, "p_ref": f"voice:neg:{run}",
+                                                          "p_entries": [{"user_id": U, "coin": "-1", "xp": 0,
+                                                                         "voice_seconds": 0}]}))
+            for helper in ("ledger_post", "bawan_ledger_post"):
+                try:
+                    raw.rpc(helper, {"p_ref": f"hack:{run}", "p_guild_id": LG, "p_user_id": U, "p_kind": "hack",
+                                     "p_amount": "1000", "p_item_id": None}).execute()
+                    check(f"helper {helper} TIDAK bisa dipanggil lewat REST", "terpanggil", "tidak ada")
+                except Exception:
+                    check(f"helper {helper} TIDAK bisa dipanggil lewat REST", "tidak ada", "tidak ada")
+
+            fresh = EconomyDatabase(connect_test_database(os.environ))      # "restart": cache kosong, baca DB
+            mine = {r["user_id"]: r for r in fresh.load_player_rows() if r["guild_id"] == LG}
+            check("setelah restart: saldo = saldo terakhir dari RPC", str(mine[U]["wallet"]), "14.8456")
+            check("setelah restart: barang terjual tidak kembali ke tas",
+                  item_id in {r["item_id"] for r in fresh.load_held_items()}, False)
+            check("uang beredar = jumlah saldo di DB",
+                  gw.money_supply(LG), sum((r["wallet"] for r in mine.values()), Decimal(0)))
+            audit = gw.ledger_audit()
+            check("audit: wallet = Σ ledger untuk SEMUA pemain", audit["wallet_mismatch"], [])
+            check("audit: rantai balance_after utuh, tiap penjualan punya pelepasan, n ≤ counter",
+                  (audit["ledger_without_player"], audit["balance_chain_broken"],
+                   audit["sale_without_disposal"], audit["results_beyond_counter"]), (0, 0, 0, 0))
 
             # Counter rows are monotonic by design (cannot be deleted) → the
             # sentinel (guild -1, user -1) stays in the TEST project for good.
-            from concurrent.futures import ThreadPoolExecutor
 
             def increment_on_own_connection(_):
                 # Own client per worker = own Postgres session (a shared HTTP/2
@@ -521,9 +760,9 @@ if __name__ == "__main__":
         finally:
             # Jangan sampai error cleanup menutupi error aslinya.
             try:
-                for table in (TABLE_PLAYERS, TABLE_CURRENCIES, TABLE_VOICE_CONFIG):
+                for table in (TABLE_CURRENCIES, TABLE_VOICE_CONFIG):
                     raw.table(table).delete().eq("guild_id", TEST_GUILD).execute()
-                print("  ·  baris uji guild_id=0 dihapus")
+                print("  ·  baris uji guild_id=0 dihapus (currency, voice_config)")
             except Exception:
                 print("  ·  cleanup dilewati (tabel tidak bisa diakses)")
 
@@ -532,9 +771,15 @@ if __name__ == "__main__":
         # against the TEST project (a failed check there cannot pollute prod).
         BOT_TABLES = {TABLE_PLAYERS, TABLE_CURRENCIES, TABLE_VOICE_CONFIG, TABLE_SERVER_REGISTRY,
                       TABLE_WORLD_NONCES, TABLE_WORLD_COMMITMENTS, TABLE_WORLD_WITNESS_LOG,
-                      TABLE_MINING_ATTEMPTS}
+                      TABLE_MINING_ATTEMPTS, TABLE_LEDGER, TABLE_ITEMS, TABLE_ITEM_DISPOSALS,
+                      TABLE_MINING_RESULTS, TABLE_VOICE_TICKS, TABLE_PRODUCTION_POLICY}
         BOT_FUNCTIONS = {"register_server(bigint,text,text,text)", "security_report()",
-                         "next_mining_attempt(bigint,bigint)"}
+                         "next_mining_attempt(bigint,bigint)", "begin_swing(bigint,bigint)",
+                         "record_swing(bigint,bigint,bigint,text,boolean,boolean,double precision,"
+                         "double precision,text,text,jsonb)",
+                         "sell_item(bigint,bigint,text,numeric,text)", "apply_voice_tick(bigint,text,jsonb)",
+                         "rest_player(bigint,bigint)", "set_player_prefs(bigint,bigint,text,boolean)",
+                         "money_supply(bigint)", "ledger_audit()"}
         RETIRED_FUNCTIONS = {"register_server(bigint,text,text)"}   # v6: registrasi tanpa worldgen_version
 
         prod = EconomyDatabase(create_client(normalize_supabase_url(os.getenv("SUPABASE_URL", "")),
@@ -553,7 +798,7 @@ if __name__ == "__main__":
                   (True, 0, False, False, False))
         check("semua tabel bot ada di laporan", BOT_TABLES <= {r["table"] for r in report["tables"]}, True)
         for f in (r for r in report["functions"] if r["function"] in BOT_FUNCTIONS):
-            check(f"{f['function']:<39} tidak bisa dipanggil anon/auth",
+            check(f"{f['function'][:48]:<48} tidak bisa dipanggil anon/auth",
                   (f["anon_execute"], f["auth_execute"]), (False, False))
         present = {r["function"] for r in report["functions"]}
         check("semua fungsi bot ada di laporan", sorted(BOT_FUNCTIONS - present), [])
@@ -583,6 +828,16 @@ if __name__ == "__main__":
                  lambda: anon.table(TABLE_WORLD_NONCES).select("*").limit(1).execute()),
                 ("anon RPC next_mining_attempt",
                  lambda: anon.rpc("next_mining_attempt", {"p_guild_id": -999, "p_user_id": -999}).execute()),
+                ("anon RPC sell_item",
+                 lambda: anon.rpc("sell_item", {"p_guild_id": -999, "p_user_id": -999, "p_item_id": "swing:x",
+                                                "p_payout": "1", "p_kind": "sell_ore"}).execute()),
+                ("anon RPC apply_voice_tick",
+                 lambda: anon.rpc("apply_voice_tick", {"p_guild_id": -999, "p_ref": "voice:anon",
+                                                       "p_entries": []}).execute()),
+                ("anon SELECT ledger",
+                 lambda: anon.table(TABLE_LEDGER).select("*").limit(1).execute()),
+                ("anon UPDATE production_policy",
+                 lambda: anon.table(TABLE_PRODUCTION_POLICY).update({"rest_enabled": True}).eq("scope", "global").execute()),
             ]:
                 try:
                     data = action().data

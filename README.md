@@ -6,8 +6,27 @@ Bot Discord ekonomi MMORPG per-server. Dunia tiap server (unsur, ore, crystal, m
 
 1. `pip install -r requirements.txt`
 2. Salin `.env.example` → `.env`, lalu isi semua nilainya (lihat komentar di file itu).
-3. Jalankan seluruh `supabase/schema.sql` di Supabase SQL Editor. Aman diulang.
+3. Jalankan seluruh `supabase/schema.sql` di Supabase SQL Editor. Aman diulang. **Kalau bot versi lama sedang jalan, matikan dulu**: sejak v7 saldo hanya bisa berubah lewat fungsi ledger, jadi penyimpanan bot lama akan ditolak.
 4. `python main_core.py`
+5. Cek semuanya sekaligus: `python cek_live.py` (keamanan, registry, ledger, commitment, tes worldgen).
+
+## Saldo & ledger (schema v7)
+
+Database adalah satu-satunya sumber kebenaran. Setiap perubahan pemain = **satu fungsi = satu transaksi Postgres**, dan setiap perubahan saldo meninggalkan satu baris di `ledger` (insert-only). Bot tidak punya flush berkala; memori hanya salinan baca yang diisi dari hasil fungsi.
+
+| Aksi | Fungsi DB | Jaminan |
+|---|---|---|
+| Ayunan (manual & auto) | `begin_swing` → roll → `record_swing` | n naik atomik sebelum roll; hasil tercatat sekali per n di `mining_results`; stamina dicek di DB |
+| `/sell_ore`, `/sell_crystal` | `sell_item` | barang terkunci; `item_disposals` (PK) → satu barang hanya bisa dijual sekali |
+| Reward voice | `apply_voice_tick` | satu tick = satu transaksi; `ref` tetap → retry setelah timeout tidak dobel |
+| `/rest`, pickaxe, auto mine | `rest_player`, `set_player_prefs` | bukan uang, tanpa ledger |
+
+- `players.wallet` bertipe `numeric(24,4)` dan hanya bisa berubah dari dalam fungsi ledger — trigger menolak UPDATE/INSERT langsung, termasuk dengan key service_role. Baris pemain tidak bisa dihapus.
+- Uang beredar M = jumlah saldo di DB (`money_supply`), satu sumber.
+- Helper internal ada di skema `bawan_private` yang tidak diekspos PostgREST, jadi tidak bisa dipanggil lewat REST.
+- Stamina dan batas ayunan dibaca dari tabel `production_policy`; angkanya bisa diganti tanpa mengubah skema.
+- `ledger_audit()` memeriksa wallet = Σ ledger, rantai `balance_after`, dan penjualan tanpa pelepasan.
+- `/mint_fiat` dinonaktifkan sampai ada desain kebijakan moneter.
 
 ## Asal-usul dunia (bisa diverifikasi publik)
 
@@ -59,7 +78,7 @@ Pemegang pepper (operator) bisa menghitung `seed` server mana pun, dan counter `
 Pemain biasa tidak bisa memprediksi roll karena tidak tahu pepper. Counter `n` juga tidak bisa dimundurkan atau dihapus lewat API, termasuk dengan key service_role (trigger menolaknya). Batas perlindungan ini:
 
 - Pemilik project Supabase bisa menghapus trigger lewat SQL Editor lalu memundurkan counter. Trigger melindungi dari pemegang key, bukan dari pemilik database.
-- Belum ada log per ayunan (node, `n`, hasil). Setelah pepper dibuka, roll bisa dihitung ulang, tapi belum bisa dicocokkan dengan riwayat ayunan yang sebenarnya terjadi.
+- Sejak v7 setiap ayunan tercatat di `mining_results` (node, `n`, hasil, stamina, barang). Setelah pepper dibuka, roll bisa dihitung ulang dan dicocokkan dengan log itu. Batasnya: log ini ada di database operator dan belum dipublikasikan ke saksi eksternal, jadi pemilik database masih bisa mengubahnya setelah menghapus trigger.
 
 **Rencana mitigasi (BELUM aktif):** masukkan randomness drand ke pre-image roll:
 
@@ -68,3 +87,15 @@ roll = HMAC-SHA256(seed, "mining|{guild_id}|{user_id}|{node_id}|{n}|{drand_round
 ```
 
 dengan `drand_round` = ronde pertama **setelah** counter `n` dinaikkan (waktu dari jam DB), dan ronde + signature-nya disimpan per percobaan supaya bisa diaudit. Karena ronde itu belum ada saat `n` dikunci, operator pun tidak bisa tahu hasilnya lebih dulu. Konsekuensi yang harus diterima kalau ini diaktifkan: tiap ayunan menunggu ±3 detik (periode quicknet), dan kalau drand tidak bisa dihubungi ayunan ditolak (tanpa fallback, sama seperti Stage 0).
+
+### Pemegang key bisa mencetak uang, tapi tidak diam-diam
+
+Jumlah payout (`/sell_ore`, reward voice) dihitung oleh bot, lalu database mencatatnya. Siapa pun yang memegang key service_role bisa memanggil `sell_item` / `apply_voice_tick` dengan jumlah berapa pun. Ledger tidak mencegah ini. Yang dijamin ledger: setiap unit uang punya baris dengan `kind`, `ref`, dan waktu, rantai saldo tidak bisa diputus, dan tidak ada baris yang bisa diubah atau dihapus tanpa menghapus trigger dulu.
+
+### Cadangan node masih di memori
+
+Pengurangan cadangan node saat nambang belum disimpan ke database, jadi restart mengembalikan node ke penuh. Ini dikerjakan di langkah berikutnya (persist cadangan node + batas produksi), sebelum LANGKAH 5.
+
+## Dokumen desain
+
+- [`docs/desain_konversi.md`](docs/desain_konversi.md): konversi antar-server (Model A + kuota produksi). Belum dikerjakan; urutannya setelah LANGKAH 6 dan sink.

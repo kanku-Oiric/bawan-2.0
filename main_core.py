@@ -79,8 +79,10 @@ import sys
 import math
 import signal
 import time
+import uuid
 import asyncio
 import logging
+from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
@@ -109,7 +111,6 @@ from economy import EconomyOracle
 from economy_engine import EconomyEngine
 from economy_engine import EconomyEngine
 from currency_engine import CurrencyEngine, preview_manifest, CurrencyManifest
-from mint_cap import CentralBankEngine
 from voice_engine import (
     VoiceSessionTracker,
     VoiceConfig,
@@ -125,7 +126,7 @@ from voice_engine import (
     BLOCK_MUTE_DEAF,
     BLOCK_ALONE,
 )
-from db_ekonomi_pusat import EconomyDatabase, normalize_supabase_url
+from db_ekonomi_pusat import EconomyDatabase, LedgerRejected, normalize_supabase_url
 from automine_engine import AutoSwing, plan_swing, choose_best_node, node_label
 from mining_swing import SwingOutcome, execute_swing
 from world_registry import (
@@ -175,8 +176,8 @@ _witness = WebhookWitness(WORLD_LOG_WEBHOOK)
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="supabase")
 
 
-async def _run_db(fn: Callable[..., Any], *args: Any) -> Any:
-    return await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, fn, *args)
+async def _run_db(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    return await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, partial(fn, *args, **kwargs))
 
 logging.basicConfig(
     level    = logging.INFO,
@@ -184,7 +185,7 @@ logging.basicConfig(
     datefmt  = "%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("main_core")
-# httpx logs every Supabase request at INFO; the player flush runs every tick.
+# httpx logs every Supabase request at INFO; every player change is one.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 if not DISCORD_TOKEN:
@@ -207,9 +208,11 @@ _crystal_factory = CrystalFactory()
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3 — PERSISTENCE LAYER (write-through cache over Supabase)
 # ─────────────────────────────────────────────────────────────────────────────
-# Players, currencies and voice config are loaded from Supabase in
-# BawanBot.setup_hook() and written back via db_ekonomi_pusat.  World state
-# (spawn/catalog/profile) stays in-memory and is rebuilt deterministically.
+# Supabase is the source of truth (schema v7).  Every player change is ONE
+# RPC = one Postgres transaction (+ one ledger row when money moves); the
+# in-memory profiles below are a read cache, updated only from what an RPC
+# returned.  There is no periodic flush.  World state (spawn/catalog/profile)
+# stays in-memory and is rebuilt deterministically.
 
 PlayerKey = Tuple[int, int]   # (guild_id, user_id)
 
@@ -223,10 +226,6 @@ _GLOBAL_WORLD_RECORDS: Dict[int, WorldRecord]              = {}   # Stage 0 cach
 _WORLD_COMMITMENT_ROWS: List[dict]                         = []   # Stage 1 (published)
 _WITNESS_DELIVERED: Set[str]                               = set()
 
-# Last row successfully written to Supabase per player; used to flush only
-# profiles that actually changed.
-_PLAYER_SAVED_ROWS: Dict[PlayerKey, dict] = {}
-
 # Constant for default player stamina.
 _DEFAULT_STAMINA: float = 100.0
 
@@ -234,56 +233,52 @@ _DEFAULT_STAMINA: float = 100.0
 @dataclass
 class PlayerProfile:
     """
-    Runtime profile for one Discord user INSIDE one server.
-    Persisted as one row of the Supabase `players` table.
+    Read CACHE of one Discord user's row INSIDE one server (Supabase `players`
+    + their held `items`).  Never the source of truth: every field is set from
+    an RPC result (or the startup load), never computed and saved from here.
 
-    stamina        : Current stamina (0.0 – 100.0).  Decays per mining swing.
+    stamina        : Stamina at the last DB read (0.0 – cap).
     pickaxe_key    : Key into mining_engine.PICKAXES; last-used tool.
-    ore_bag        : List of OreItem frozen records harvested.
-    crystal_bag    : List of CrystalItem frozen records harvested.
-    wallet         : Balance in this server's official currency.
-    xp / level     : Progression (level derived via voice_engine.level_for_xp).
+    held           : item_id → OreItem | CrystalItem, in acquisition order.
+                     item_id is the DB identity ("swing:g:u:n" / "legacy:…").
+    wallet         : Balance in this server's official currency (display copy).
+    xp / level     : Progression (level = voice_engine.level_for_xp, computed in SQL).
     voice_seconds  : Total time spent in non-AFK voice channels.
     automine       : Registered for auto mining (/automine daftar).
     """
     stamina:      float            = _DEFAULT_STAMINA
     pickaxe_key:  str              = "copper_starter"
-    ore_bag:      List[OreItem]    = field(default_factory=list)
-    crystal_bag:  List[CrystalItem]= field(default_factory=list)
     wallet:       float            = 0.0
     xp:           int              = 0
     level:        int              = 1
     voice_seconds: float           = 0.0
     automine:     bool             = False
+    held:         Dict[str, Union[OreItem, CrystalItem]] = field(default_factory=dict)
 
-    def to_row(self, guild_id: int, user_id: int) -> dict:
-        return {
-            "guild_id":      guild_id,
-            "user_id":       user_id,
-            "stamina":       self.stamina,
-            "pickaxe_key":   self.pickaxe_key,
-            "wallet":        self.wallet,
-            "xp":            self.xp,
-            "level":         self.level,
-            "voice_seconds": round(self.voice_seconds, 3),
-            "ore_bag":       [item.to_dict() for item in self.ore_bag],
-            "crystal_bag":   [item.to_dict() for item in self.crystal_bag],
-            "automine":      self.automine,
-        }
+    @property
+    def ore_bag(self) -> List[OreItem]:
+        return [item for item in self.held.values() if isinstance(item, OreItem)]
+
+    @property
+    def crystal_bag(self) -> List[CrystalItem]:
+        return [item for item in self.held.values() if isinstance(item, CrystalItem)]
 
     @classmethod
     def from_row(cls, row: dict) -> "PlayerProfile":
         return cls(
             stamina       = float(row["stamina"]),
             pickaxe_key   = row["pickaxe_key"],
-            ore_bag       = [OreItem(**d) for d in row["ore_bag"]],
-            crystal_bag   = [CrystalItem(**d) for d in row["crystal_bag"]],
             wallet        = float(row["wallet"]),
             xp            = int(row["xp"]),
             level         = int(row["level"]),
             voice_seconds = float(row["voice_seconds"]),
             automine      = bool(row["automine"]),
         )
+
+
+def _item_from_row(row: dict) -> Union[OreItem, CrystalItem]:
+    payload = row["payload"]
+    return OreItem(**payload) if row["kind"] == "ore" else CrystalItem(**payload)
 
 
 def _get_player(guild_id: int, user_id: int) -> PlayerProfile:
@@ -293,13 +288,53 @@ def _get_player(guild_id: int, user_id: int) -> PlayerProfile:
         _GLOBAL_PLAYER_REGISTRY[key] = PlayerProfile()
     return _GLOBAL_PLAYER_REGISTRY[key]
 
-def _get_server_circulation(guild_id: int) -> float:
-    """Menghitung total uang fiat yang sedang beredar di tangan semua player server ini."""
-    total = 0.0
-    for (g_id, _), profile in _GLOBAL_PLAYER_REGISTRY.items():
-        if g_id == guild_id:
-            total += profile.wallet
-    return total
+# One lock per player: a double click can never interleave two swings (or a
+# swing and a sale) of the same player between their DB calls.
+_PLAYER_LOCKS: Dict[PlayerKey, asyncio.Lock] = {}
+
+
+def _player_lock(guild_id: int, user_id: int) -> asyncio.Lock:
+    return _PLAYER_LOCKS.setdefault((guild_id, user_id), asyncio.Lock())
+
+
+async def _money_supply(guild_id: int) -> float:
+    """Uang beredar = jumlah saldo di DB (satu sumber).  Raises if the DB is unreachable."""
+    return float(await _run_db(_economy_db.money_supply, guild_id))
+
+
+async def _save_prefs(guild_id: int, user_id: int, *, pickaxe_key: Optional[str] = None,
+                      automine: Optional[bool] = None) -> "PlayerProfile":
+    pickaxe, auto = await _run_db(_economy_db.set_player_prefs, guild_id, user_id, pickaxe_key, automine)
+    player = _get_player(guild_id, user_id)
+    player.pickaxe_key, player.automine = pickaxe, auto
+    return player
+
+
+_DB_UNAVAILABLE_TEXT: str = "⛔ Database tidak bisa dihubungi. Tidak ada yang berubah — coba lagi sebentar lagi."
+_REST_DISABLED_TEXT: str = "💤 Istirahat instan sedang dinonaktifkan — stamina pulih seiring waktu."
+
+
+async def _handle_rest(interaction: discord.Interaction) -> None:
+    """/rest and the Rest button: stamina = cap, decided by the DB (production_policy)."""
+    guild_id, user_id = interaction.guild_id, interaction.user.id
+    try:
+        before, after = await _run_db(_economy_db.rest_player, guild_id, user_id)
+    except LedgerRejected as exc:
+        text = _REST_DISABLED_TEXT if exc.code == "rest_disabled" else f"⛔ Ditolak database: `{exc.code}`"
+        await interaction.response.send_message(text, ephemeral=True)
+        return
+    except Exception:
+        log.exception("rest_player failed guild=%s user=%s", guild_id, user_id)
+        await interaction.response.send_message(_DB_UNAVAILABLE_TEXT, ephemeral=True)
+        return
+    _get_player(guild_id, user_id).stamina = after
+    await interaction.response.send_message(
+        content   = (
+            f"💤  **{interaction.user.display_name}** rested.\n"
+            f"Stamina restored: **{before:.1f}** → **{after:.0f}**"
+        ),
+        ephemeral = True,
+    )
 
 
 def _get_voice_config(guild_id: int) -> VoiceConfig:
@@ -323,10 +358,10 @@ async def _load_persistent_state() -> None:
         log.warning("WORLD_LOG_WEBHOOK kosong — saksi eksternal nonaktif; event menunggu di antrean sampai diisi.")
 
     for row in await _run_db(_economy_db.load_player_rows):
-        key = (int(row["guild_id"]), int(row["user_id"]))
-        profile = PlayerProfile.from_row(row)
-        _GLOBAL_PLAYER_REGISTRY[key] = profile
-        _PLAYER_SAVED_ROWS[key] = profile.to_row(*key)
+        _GLOBAL_PLAYER_REGISTRY[(int(row["guild_id"]), int(row["user_id"]))] = PlayerProfile.from_row(row)
+    held_items = await _run_db(_economy_db.load_held_items)
+    for row in held_items:
+        _get_player(int(row["guild_id"]), int(row["owner_id"])).held[row["item_id"]] = _item_from_row(row)
 
     _GLOBAL_CURRENCY_REGISTRY.update(await _run_db(_economy_db.load_currencies))
     _GLOBAL_VOICE_CONFIG_REGISTRY.update(await _run_db(_economy_db.load_voice_configs))
@@ -334,26 +369,14 @@ async def _load_persistent_state() -> None:
     # stop the bot loudly instead of being silently used.
     _GLOBAL_WORLD_RECORDS.update(await _run_db(_world_registry.load_all))
     log.info(
-        "Supabase loaded: %d player(s), %d currency(ies), %d voice config(s), %d world(s) (%d pending).",
-        len(_GLOBAL_PLAYER_REGISTRY), len(_GLOBAL_CURRENCY_REGISTRY), len(_GLOBAL_VOICE_CONFIG_REGISTRY),
+        "Supabase loaded: %d player(s), %d held item(s), %d currency(ies), %d voice config(s), "
+        "%d world(s) (%d pending).",
+        len(_GLOBAL_PLAYER_REGISTRY), len(held_items), len(_GLOBAL_CURRENCY_REGISTRY),
+        len(_GLOBAL_VOICE_CONFIG_REGISTRY),
         len(_GLOBAL_WORLD_RECORDS),
         sum(1 for r in _GLOBAL_WORLD_RECORDS.values() if r.status != STATUS_ACTIVE),
     )
 
-
-async def _flush_players() -> int:
-    """Upsert every profile whose row differs from the last saved one."""
-    dirty = []
-    for key, profile in list(_GLOBAL_PLAYER_REGISTRY.items()):
-        row = profile.to_row(*key)
-        if _PLAYER_SAVED_ROWS.get(key) != row:
-            dirty.append(row)
-    if not dirty:
-        return 0
-    await _run_db(_economy_db.upsert_player_rows, dirty)
-    for row in dirty:
-        _PLAYER_SAVED_ROWS[(row["guild_id"], row["user_id"])] = row
-    return len(dirty)
 
 class WorldPending(Exception):
     """The guild has no active Stage-0 world nonce yet (drand round pending)."""
@@ -788,16 +811,7 @@ class NodeSelectView(discord.ui.View):
         )
 
     async def _on_rest(self, interaction: discord.Interaction) -> None:
-        player = _get_player(self.guild_id, interaction.user.id)
-        old_stamina = player.stamina
-        player.stamina = _DEFAULT_STAMINA
-        await interaction.response.send_message(
-            content   = (
-                f"💤  **{interaction.user.display_name}** rested.\n"
-                f"Stamina restored: **{old_stamina:.1f}** → **{_DEFAULT_STAMINA:.0f}**"
-            ),
-            ephemeral = True,
-        )
+        await _handle_rest(interaction)
 
 
 class ToolSelectView(discord.ui.View):
@@ -869,9 +883,15 @@ class ToolSelectView(discord.ui.View):
             return
 
         player = _get_player(guild_id, user_id)
-        player.pickaxe_key = pickaxe_key
+        if player.pickaxe_key != pickaxe_key:
+            try:
+                await _save_prefs(guild_id, user_id, pickaxe_key=pickaxe_key)
+            except Exception:
+                log.exception("Saving pickaxe failed guild=%d user=%d", guild_id, user_id)
+                await interaction.followup.send(_SWING_REJECTED_TEXT, ephemeral=True)
+                return
 
-        # ── Stamina check ─────────────────────────────────────────────────────
+        # ── Stamina check (cache; the DB re-checks in record_swing) ───────────
         if player.stamina <= 0.0:
             await interaction.followup.send(
                 "💨 You're exhausted! Use the **Rest** button to recover stamina.",
@@ -882,8 +902,8 @@ class ToolSelectView(discord.ui.View):
         # ── Execute the swing (single path shared with auto mine) ─────────────
         try:
             outcome = await _mining_swing(guild_id, user_id, player, self.node_id, pickaxe, state, catalog)
-        except SwingRejected:
-            await interaction.followup.send(_SWING_REJECTED_TEXT, ephemeral=True)
+        except SwingRejected as exc:
+            await interaction.followup.send(_swing_rejected_text(exc), ephemeral=True)
             return
         except (KeyError, ValueError) as exc:
             log.warning("Mining attempt error: %s", exc)
@@ -939,7 +959,7 @@ class ToolSelectView(discord.ui.View):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BawanBot(commands.Bot):
-    """commands.Bot + Supabase load on startup and a final flush on shutdown."""
+    """commands.Bot + Supabase load on startup.  Nothing to flush on shutdown: every change is already in the DB."""
 
     async def setup_hook(self) -> None:
         await _load_persistent_state()
@@ -951,11 +971,9 @@ class BawanBot(commands.Bot):
         for loop in (_voice_tick, _resolve_pending_worlds, _witness_tick):
             if loop.is_running():
                 loop.cancel()
-        try:
-            saved = await _flush_players()
-            log.info("Shutdown flush: %d player(s) saved to Supabase.", saved)
-        except Exception:
-            log.exception("Shutdown flush to Supabase FAILED — recent changes may be lost.")
+        unsent = sum(len(b) for b in _VOICE_OUTBOX.values())
+        if unsent:
+            log.warning("Shutdown with %d voice batch(es) not confirmed by the DB — those rewards are lost.", unsent)
         await super().close()
 
 
@@ -1133,16 +1151,7 @@ async def inventory(interaction: discord.Interaction) -> None:
 @app_commands.guild_only()
 async def rest(interaction: discord.Interaction) -> None:
     """Manual stamina restore command. Equivalent to the Rest button on the embed."""
-    player      = _get_player(interaction.guild_id, interaction.user.id)
-    old_stamina = player.stamina
-    player.stamina = _DEFAULT_STAMINA
-    await interaction.response.send_message(
-        content   = (
-            f"💤  **{interaction.user.display_name}** rested.\n"
-            f"Stamina restored: **{old_stamina:.1f}** → **{_DEFAULT_STAMINA:.0f}**"
-        ),
-        ephemeral = True,
-    )
+    await _handle_rest(interaction)
 
 
 @bot.tree.command(
@@ -1223,7 +1232,12 @@ async def market_status(interaction: discord.Interaction) -> None:
         return
 
     catalog = _GLOBAL_CATALOG_REGISTRY[guild_id]
-    current_circulation = _get_server_circulation(guild_id)
+    try:
+        current_circulation = await _money_supply(guild_id)
+    except Exception:
+        log.exception("money_supply failed guild=%s", guild_id)
+        await interaction.followup.send(_DB_UNAVAILABLE_TEXT, ephemeral=True)
+        return
 
     # 1. Panggil Arsitektur Mesin Terbaru (Bukan audit_monetary_health lagi!)
     report = EconomyEngine.evaluate_server_capability(catalog, current_circulation)
@@ -1272,6 +1286,41 @@ async def market_status(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=em, ephemeral=True)
 
 
+async def _sell_held_item(
+    interaction: discord.Interaction, guild_id: int, user_id: int, item_id: str, payout: float, kind: str,
+) -> Optional[float]:
+    """
+    Sell one held item in ONE DB transaction (disposal + ledger + wallet).
+    Returns the new balance, or None after telling the user why nothing happened.
+    The cache changes only after the DB confirmed.
+    """
+    player = _get_player(guild_id, user_id)
+    if payout <= 0:
+        await interaction.followup.send("❌ Nilai jual barang ini terlalu kecil (0 setelah pembulatan).", ephemeral=True)
+        return None
+    async with _player_lock(guild_id, user_id):
+        try:
+            balance, already = await _run_db(_economy_db.sell_item, guild_id, user_id, item_id, payout, kind)
+        except LedgerRejected as exc:
+            if exc.code in ("item_not_owned", "item_already_disposed"):
+                player.held.pop(item_id, None)          # the cache was stale; the DB is right
+                await interaction.followup.send("❌ Barang itu sudah tidak ada di tas lu (sudah terjual).", ephemeral=True)
+            else:
+                await interaction.followup.send(f"⛔ Transaksi ditolak database: `{exc.code}`", ephemeral=True)
+            return None
+        except Exception:
+            log.exception("sell_item failed guild=%d user=%d item=%s", guild_id, user_id, item_id)
+            await interaction.followup.send(_DB_UNAVAILABLE_TEXT, ephemeral=True)
+            return None
+        player.held.pop(item_id, None)
+        player.wallet = float(balance)
+    if already:
+        await interaction.followup.send(
+            f"ℹ️ Barang itu sudah terjual sebelumnya. Saldo: **{player.wallet:.2f} Fiat**", ephemeral=True)
+        return None
+    return player.wallet
+
+
 # ── COMMAND SELL ORE (TERBARU) ───────────────────────────────────────────────
 @bot.tree.command(name="sell_ore", description="Jual ore hasil tambang lu ke pasar NPC lokal")
 @app_commands.describe(element_symbol="Simbol elemen atau nama ore (misal: Fe, Cu, Au, UA, Mineral Vein)")
@@ -1287,26 +1336,28 @@ async def sell_ore(interaction: discord.Interaction, element_symbol: str) -> Non
     catalog = _GLOBAL_CATALOG_REGISTRY[guild_id]
     player = _get_player(guild_id, user_id)
 
-    target_item = None
     search_query = element_symbol.strip().lower()
-    
-    for item in player.ore_bag:
-        if (item.element_symbol.lower() == search_query or 
-            item.display_name.lower() == search_query or 
-            item.ore_name.lower() == search_query):
-            target_item = item
-            break
-
-    if not target_item:
+    target = next(
+        ((item_id, item) for item_id, item in player.held.items()
+         if isinstance(item, OreItem) and search_query in (item.element_symbol.lower(), item.display_name.lower())),
+        None,
+    )
+    if target is None:
         await interaction.followup.send(f"❌ Di tas lu gak ada Ore dengan simbol atau nama `[{element_symbol}]`, Amerta!", ephemeral=True)
         return
+    item_id, target_item = target
 
     quote = EconomyOracle.calculate_ore_price(target_item, catalog)
 
-    # Integrasi Layer 2
-    current_circulation = _get_server_circulation(guild_id)
+    # Integrasi Layer 2 — uang beredar dibaca dari DB
+    try:
+        current_circulation = await _money_supply(guild_id)
+    except Exception:
+        log.exception("money_supply failed guild=%s", guild_id)
+        await interaction.followup.send(_DB_UNAVAILABLE_TEXT, ephemeral=True)
+        return
     audit = EconomyEngine.evaluate_server_capability(catalog, current_circulation)
-    
+
     # Blokir transaksi jika server belum merdeka
     if not audit.is_eligible:
         alasan = "\n".join(audit.reasons)
@@ -1314,9 +1365,8 @@ async def sell_ore(interaction: discord.Interaction, element_symbol: str) -> Non
         return
 
     fiat_payout = round(quote.total_value * audit.seigniorage_modifier, 4)
-
-    player.ore_bag.remove(target_item)
-    player.wallet += fiat_payout
+    if await _sell_held_item(interaction, guild_id, user_id, item_id, fiat_payout, "sell_ore") is None:
+        return
 
     em = discord.Embed(title="💰 NPC MARKET TRANSACTION SUCCESS", color=discord.Color.green())
     em.add_field(name="📦 Komoditas", value=f"`{target_item.display_name}`", inline=True)
@@ -1345,32 +1395,37 @@ async def sell_crystal(interaction: discord.Interaction, crystal_name: str) -> N
     catalog = _GLOBAL_CATALOG_REGISTRY[guild_id]
     player = _get_player(guild_id, user_id)
 
-    target_item = None
-    for item in player.crystal_bag:
-        if item.display_name.strip().lower() == crystal_name.strip().lower():
-            target_item = item
-            break
-
-    if not target_item:
+    target = next(
+        ((item_id, item) for item_id, item in player.held.items()
+         if isinstance(item, CrystalItem) and item.display_name.strip().lower() == crystal_name.strip().lower()),
+        None,
+    )
+    if target is None:
         await interaction.followup.send(f"❌ Di tas kristal lu gak ada kristal bernama `[{crystal_name}]`, Amerta!", ephemeral=True)
         return
+    item_id, target_item = target
 
     purity_map = {"Flawed": 1.0, "Prismatic": 1.6, "Ethereal": 2.5}
     purity_mod = purity_map.get(target_item.quality, 1.0)
-    
+
     if target_item.crystal_affinity in ["POWER", "MANA", "MUTATION"]:
         base_multiplier = max(30.0, catalog.strategic_resource_score * 0.25)
     else:
         base_multiplier = max(20.0, catalog.luxury_resource_score * 0.15)
-        
+
     scarcity_mult = max(0.5, 2.0 - catalog.dominance_ratio)
     price_per_unit = base_multiplier * scarcity_mult * purity_mod
     raw_value = round(price_per_unit * (target_item.weight_tonnes * 0.1), 4)
 
-    # Integrasi Layer 2
-    current_circulation = _get_server_circulation(guild_id)
+    # Integrasi Layer 2 — uang beredar dibaca dari DB
+    try:
+        current_circulation = await _money_supply(guild_id)
+    except Exception:
+        log.exception("money_supply failed guild=%s", guild_id)
+        await interaction.followup.send(_DB_UNAVAILABLE_TEXT, ephemeral=True)
+        return
     audit = EconomyEngine.evaluate_server_capability(catalog, current_circulation)
-    
+
     # Blokir transaksi jika server belum merdeka
     if not audit.is_eligible:
         alasan = "\n".join(audit.reasons)
@@ -1378,9 +1433,8 @@ async def sell_crystal(interaction: discord.Interaction, crystal_name: str) -> N
         return
 
     fiat_payout = round(raw_value * audit.seigniorage_modifier, 4)
-
-    player.crystal_bag.remove(target_item)
-    player.wallet += fiat_payout
+    if await _sell_held_item(interaction, guild_id, user_id, item_id, fiat_payout, "sell_crystal") is None:
+        return
 
     em = discord.Embed(title="🔮 NPC CRYSTAL MARKET TRANSACTION SUCCESS", color=discord.Color.blue())
     em.add_field(name="📦 Komoditas", value=f"`{target_item.display_name}`", inline=True)
@@ -1417,7 +1471,12 @@ async def found_currency(interaction: discord.Interaction, currency_name: str, t
         return
 
     catalog = _GLOBAL_CATALOG_REGISTRY[guild_id]
-    current_circulation = _get_server_circulation(guild_id)
+    try:
+        current_circulation = await _money_supply(guild_id)
+    except Exception:
+        log.exception("money_supply failed guild=%s", guild_id)
+        await interaction.followup.send(_DB_UNAVAILABLE_TEXT, ephemeral=True)
+        return
 
     # 3. Audit Bank Sentral (Layer 2)
     audit = EconomyEngine.evaluate_server_capability(catalog, current_circulation)
@@ -1460,73 +1519,22 @@ async def found_currency(interaction: discord.Interaction, currency_name: str, t
         # Nangkep error dari validasi regex ticker/nama atau audit gagal
         await interaction.followup.send(f"❌ **GENESIS FAILED**\n{str(e)}", ephemeral=True)
 
-@bot.tree.command(name="mint_fiat", description="[ADMIN ONLY] Cetak uang fiat lokal tambahan (Quantitative Easing)")
+_MINT_DISABLED_TEXT: str = (
+    "⏸️ `/mint_fiat` dinonaktifkan sampai ada desain kebijakan moneter. Uang beredar sekarang "
+    "= jumlah saldo pemain di database; cetak uang baru harus punya tujuan yang tercatat di ledger."
+)
+
+
+@bot.tree.command(name="mint_fiat", description="[ADMIN · NONAKTIF] Cetak uang — menunggu desain kebijakan moneter")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-@app_commands.describe(amount="Jumlah uang yang mau dicetak (misal: 50000)")
+@app_commands.describe(amount="Jumlah uang yang mau dicetak (sementara nonaktif)")
 async def mint_fiat(interaction: discord.Interaction, amount: float) -> None:
-    await interaction.response.defer(ephemeral=False) # Biar se-server liat inflasi nambah wkwk
-    guild_id = interaction.guild_id
-
-    if guild_id not in _GLOBAL_SPAWN_REGISTRY:
-        await interaction.followup.send("❌ Server belum di-survei. Ketik `/explore_mines` dulu.")
-        return
-
-    if guild_id not in _GLOBAL_CURRENCY_REGISTRY:
-        await interaction.followup.send("❌ Server ini belum meresmikan mata uang. Pakai `/found_currency` dulu!")
-        return
-
-    catalog = _GLOBAL_CATALOG_REGISTRY[guild_id]
-    manifest = _GLOBAL_CURRENCY_REGISTRY[guild_id]
-    
-    # 1. Lempar request ke Layer 4 (Operasional Bank Sentral)
-    report = CentralBankEngine.evaluate_minting_request(
-        manifest=manifest,
-        current_geology_score=catalog.total_resource_score,
-        mint_amount=amount
-    )
-
-    # 2. Jika Bank Sentral MENOLAK (Hard cap jebol / geologi hancur)
-    if not report.success:
-        em_fail = discord.Embed(
-            title="⛔ PENCETAKAN UANG DITOLAK", 
-            description=f"**Alasan:** {report.reason}", 
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=em_fail)
-        return
-
-    # 3. Jika Bank Sentral MENYETUJUI, update state manifest yang Frozen
-    new_manifest = dataclasses.replace(
-        manifest,
-        total_supply=report.new_total_supply,
-        circulating_supply=manifest.circulating_supply + report.amount_to_circulate,
-        reserve_supply=manifest.reserve_supply + report.amount_to_reserve
-    )
-    
-    # Simpan ke Supabase dulu, baru timpa state lama di memori
-    try:
-        await _run_db(_economy_db.upsert_currency, new_manifest)
-    except Exception:
-        log.exception("Gagal menyimpan hasil mint guild %s ke Supabase", guild_id)
-        await interaction.followup.send("⛔ Pencetakan dibatalkan: gagal menyimpan ke database.")
-        return
-    _GLOBAL_CURRENCY_REGISTRY[guild_id] = new_manifest
-
-    # 4. Render Output Estetik
-    em = discord.Embed(
-        title="🖨️ QUANTITATIVE EASING SUCCESS",
-        description=f"Bank Sentral **{interaction.guild.name}** resmi mencetak uang baru!",
-        color=discord.Color.green()
-    )
-    em.add_field(name="💵 Jumlah Dicetak", value=f"`+ {amount:,.2f} {manifest.ticker}`", inline=False)
-    em.add_field(name="🔄 Masuk Sirkulasi (Pasar)", value=f"`+ {report.amount_to_circulate:,.2f}`", inline=True)
-    em.add_field(name="🏦 Masuk Brankas (Reserve)", value=f"`+ {report.amount_to_reserve:,.2f}`", inline=True)
-    em.add_field(name="📈 Total Supply Terkini", value=f"`{new_manifest.total_supply:,.2f} / {manifest.policy.hard_cap_supply:,.2f}`", inline=False)
-    em.set_footer(text=report.reason)
-
-    await interaction.followup.send(embed=em)
+    # Disabled on purpose (2026-09-26).  The old body only bumped manifest
+    # numbers that no wallet ever saw; with M = Σ wallets in the DB, minting
+    # needs a monetary-policy design (who receives it, via which ledger kind).
+    await interaction.response.send_message(_MINT_DISABLED_TEXT, ephemeral=True)
 
 
 async def _admin_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
@@ -1588,47 +1596,117 @@ def _voice_snapshots(guild: discord.Guild) -> List[MemberVoiceSnapshot]:
     return snapshots
 
 
+@dataclass
+class _VoiceBatch:
+    """One tick's voice changes for one guild.  `ref` is fixed at creation, so a
+    retry after a timeout can never apply the same rewards twice."""
+    ref:     str
+    entries: Dict[int, dict]             # user_id → {user_id, coin, xp, voice_seconds}
+    swings:  Dict[int, int]              # user_id → auto mine swings owed after the DB confirmed
+    lines:   List[str]                   # log lines, written once the batch is applied
+
+
+_VOICE_UNSENT: Dict[PlayerKey, float] = {}        # VC seconds not yet inside a batch
+_VOICE_OUTBOX: Dict[int, List[_VoiceBatch]] = {}  # guild_id → batches not yet confirmed
+_VOICE_OUTBOX_MAX: int = 1440                     # ≈ 1 day of ticks; older batches are dropped (logged)
+
+
 def _sync_voice_guild(guild: discord.Guild) -> None:
-    """Checkpoint the tracker for this guild and add elapsed VC time to profiles."""
+    """Checkpoint the tracker; elapsed VC time is shown at once and saved with the next batch."""
     deltas = _voice_tracker.sync_guild(
         guild.id, _voice_snapshots(guild), _get_voice_config(guild.id), time.monotonic()
     )
     for user_id, seconds in deltas.items():
+        key = (guild.id, user_id)
         _get_player(guild.id, user_id).voice_seconds += seconds
+        _VOICE_UNSENT[key] = _VOICE_UNSENT.get(key, 0.0) + seconds
+
+
+def _pending_voice_seconds(guild_id: int, user_id: int) -> float:
+    """VC seconds already shown in the cache but not yet confirmed by the DB."""
+    queued = sum(b.entries[user_id]["voice_seconds"]
+                 for b in _VOICE_OUTBOX.get(guild_id, ()) if user_id in b.entries)
+    return _VOICE_UNSENT.get((guild_id, user_id), 0.0) + queued
 
 
 async def _pay_voice_rewards(guild: discord.Guild) -> None:
-    """Pay every completed interval in this guild's official currency + XP (+ auto mine)."""
-    config  = _get_voice_config(guild.id)
-    payouts = _voice_tracker.collect_payouts(guild.id, config)
-    if not payouts:
-        return
-
+    """
+    Build this tick's batch (VC seconds + completed intervals as coin/XP), then
+    send every pending batch in order.  Intervals leave the tracker only into a
+    batch; a batch leaves the outbox only once the DB applied it.
+    """
+    config       = _get_voice_config(guild.id)
     manifest     = _GLOBAL_CURRENCY_REGISTRY.get(guild.id)
     has_currency = manifest is not None and manifest.is_active
     audit        = None
+    can_quote    = True
     if has_currency:
-        # Same Layer-2 audit /sell_ore uses; hydration is deterministic + cached.
+        # Same Layer-2 audit /sell_ore uses; M comes from the DB.
         try:
             _, catalog, _ = _hydrate_server(guild)
-            audit = EconomyEngine.evaluate_server_capability(catalog, _get_server_circulation(guild.id))
+            audit = EconomyEngine.evaluate_server_capability(catalog, await _money_supply(guild.id))
         except WorldPending:
             audit = None     # no world yet → coin blocked (AUDIT_FAILED), XP still paid
+        except Exception as exc:
+            can_quote = False   # DB unreachable → keep the intervals in the tracker for a later tick
+            log.warning("Voice rewards guild=%d postponed: money supply unavailable (%s)", guild.id, exc)
 
-    for payout in payouts:
-        quote  = quote_reward(config, payout.intervals, has_currency=has_currency, audit=audit)
-        player = _get_player(guild.id, payout.user_id)
-        player.wallet += quote.coin
-        player.xp     += quote.xp
-        player.level   = level_for_xp(player.xp)
-        log.info(
-            "Voice reward guild=%d user=%d intervals=%d → +%.4f %s, +%d XP%s",
-            guild.id, payout.user_id, payout.intervals, quote.coin,
-            manifest.ticker if manifest else "Fiat", quote.xp,
-            f" (coin blocked: {quote.coin_blocked_reason})" if quote.coin_blocked_reason else "",
+    entries: Dict[int, dict] = {}
+    for key in [k for k in _VOICE_UNSENT if k[0] == guild.id]:
+        seconds = round(_VOICE_UNSENT.pop(key), 3)
+        if seconds > 0:
+            entries[key[1]] = {"user_id": key[1], "coin": 0.0, "xp": 0, "voice_seconds": seconds}
+
+    swings: Dict[int, int] = {}
+    lines: List[str] = []
+    for payout in (_voice_tracker.collect_payouts(guild.id, config) if can_quote else ()):
+        quote = quote_reward(config, payout.intervals, has_currency=has_currency, audit=audit)
+        entry = entries.setdefault(payout.user_id,
+                                   {"user_id": payout.user_id, "coin": 0.0, "xp": 0, "voice_seconds": 0.0})
+        entry["coin"] = round(entry["coin"] + quote.coin, 4)
+        entry["xp"] += quote.xp
+        if _get_player(guild.id, payout.user_id).automine:
+            swings[payout.user_id] = swings.get(payout.user_id, 0) + payout.intervals
+        lines.append(
+            f"Voice reward guild={guild.id} user={payout.user_id} intervals={payout.intervals} → "
+            f"+{quote.coin:.4f} {manifest.ticker if manifest else 'Fiat'}, +{quote.xp} XP"
+            + (f" (coin blocked: {quote.coin_blocked_reason})" if quote.coin_blocked_reason else "")
         )
-        if player.automine:
-            await _run_auto_mine(guild, payout.user_id, player, payout.intervals)
+
+    if entries:
+        outbox = _VOICE_OUTBOX.setdefault(guild.id, [])
+        outbox.append(_VoiceBatch(f"voice:{guild.id}:{uuid.uuid4().hex}", entries, swings, lines))
+        if len(outbox) > _VOICE_OUTBOX_MAX:
+            dropped = outbox.pop(0)
+            log.error("Voice outbox guild=%d full: dropped unconfirmed batch %s (%d player(s))",
+                      guild.id, dropped.ref, len(dropped.entries))
+    await _flush_voice_outbox(guild)
+
+
+async def _flush_voice_outbox(guild: discord.Guild) -> None:
+    outbox = _VOICE_OUTBOX.get(guild.id)
+    while outbox:
+        batch = outbox[0]
+        try:
+            rows = await _run_db(_economy_db.apply_voice_tick, guild.id, batch.ref, list(batch.entries.values()))
+        except LedgerRejected as exc:
+            outbox.pop(0)     # the DB refuses this batch by rule: retrying would block every later batch
+            log.error("Voice batch %s guild=%d refused by the DB (%s) — dropped", batch.ref, guild.id, exc.code)
+            continue
+        except Exception as exc:
+            log.warning("Voice batch %s guild=%d not confirmed (%s); retried next tick with the same ref",
+                        batch.ref, guild.id, exc)
+            return
+        outbox.pop(0)
+        for row in rows:
+            uid = int(row["user_id"])
+            player = _get_player(guild.id, uid)
+            player.wallet, player.xp, player.level = float(row["wallet"]), int(row["xp"]), int(row["level"])
+            player.voice_seconds = float(row["voice_seconds"]) + _pending_voice_seconds(guild.id, uid)
+        for line in batch.lines:
+            log.info(line)
+        for uid, n in batch.swings.items():
+            await _run_auto_mine(guild, uid, _get_player(guild.id, uid), n)
 
 
 # ── Auto mine ────────────────────────────────────────────────────────────────
@@ -1674,7 +1752,7 @@ def _regenerate_world() -> None:
 
 @tasks.loop(seconds=TRACKER_TICK_SECONDS)
 async def _voice_tick() -> None:
-    """Sync all guilds, pay completed intervals (+ auto mine), regenerate nodes, flush to Supabase."""
+    """Sync all guilds, pay completed intervals (+ auto mine) through the DB, regenerate nodes."""
     _voice_tracker.retain_guilds(g.id for g in bot.guilds)
     for guild in bot.guilds:
         try:
@@ -1686,10 +1764,6 @@ async def _voice_tick() -> None:
         _regenerate_world()
     except Exception:
         log.exception("Node regeneration failed")
-    try:
-        await _flush_players()
-    except Exception:
-        log.exception("Saving players to Supabase failed; will retry next tick.")
 
 
 @_voice_tick.before_loop
@@ -2062,26 +2136,21 @@ def _build_automine_embed(
     return em
 
 
-async def _save_players_quietly() -> None:
-    # Called after the interaction is answered; a failure is retried next tick.
-    try:
-        await _flush_players()
-    except Exception:
-        log.exception("Saving players to Supabase failed; will retry next tick.")
-
-
 @automine_group.command(name="daftar", description="Daftar auto mine — nambang otomatis selama aktif di VC")
 async def automine_daftar(interaction: discord.Interaction) -> None:
-    player  = _get_player(interaction.guild_id, interaction.user.id)
-    already = player.automine
-    player.automine = True
+    already = _get_player(interaction.guild_id, interaction.user.id).automine
+    try:
+        player = await _save_prefs(interaction.guild_id, interaction.user.id, automine=True)
+    except Exception:
+        log.exception("automine daftar failed guild=%s user=%s", interaction.guild_id, interaction.user.id)
+        await interaction.response.send_message(_DB_UNAVAILABLE_TEXT, ephemeral=True)
+        return
     em = _build_automine_embed(
         interaction.guild, interaction.user, player,
         title  = "ℹ️  Kamu sudah terdaftar auto mine" if already else "✅  Auto mine aktif!",
         colour = discord.Colour.green(),
     )
     await interaction.response.send_message(embed=em, ephemeral=True)
-    await _save_players_quietly()
 
 
 @automine_group.command(name="berhenti", description="Berhenti dari auto mine")
@@ -2090,14 +2159,18 @@ async def automine_berhenti(interaction: discord.Interaction) -> None:
     if player is None or not player.automine:
         await interaction.response.send_message("ℹ️ Kamu memang belum terdaftar auto mine.", ephemeral=True)
         return
-    player.automine = False
+    try:
+        player = await _save_prefs(interaction.guild_id, interaction.user.id, automine=False)
+    except Exception:
+        log.exception("automine berhenti failed guild=%s user=%s", interaction.guild_id, interaction.user.id)
+        await interaction.response.send_message(_DB_UNAVAILABLE_TEXT, ephemeral=True)
+        return
     em = _build_automine_embed(
         interaction.guild, interaction.user, player,
         title  = "⛔  Auto mine dimatikan",
         colour = discord.Colour.red(),
     )
     await interaction.response.send_message(embed=em, ephemeral=True)
-    await _save_players_quietly()
 
 
 @automine_group.command(name="status", description="Lihat status auto mine, target node, dan hasil terakhir")
@@ -2187,13 +2260,25 @@ def _world_seed(record: WorldRecord) -> bytes:
 # ── The one and only mining swing path (manual mining AND auto mine) ────────
 
 class SwingRejected(Exception):
-    """The attempt counter could not be incremented — the swing must not happen."""
+    """The DB did not issue or record the swing — nothing changed.  `.code` = DB rule code, if any."""
+
+    def __init__(self, message: str, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 _SWING_REJECTED_TEXT: str = (
     "⛔ Ayunan dibatalkan: pencatat nomor percobaan (database) tidak bisa dihubungi. "
     "Tidak ada yang berubah — coba lagi sebentar lagi."
 )
+_SWING_RULE_TEXT: Dict[str, str] = {
+    "rate_limited":         "⏳ Terlalu cepat — batas ayunan per menit tercapai. Tunggu sebentar.",
+    "insufficient_stamina": "💨 Stamina nggak cukup untuk ayunan ini.",
+}
+
+
+def _swing_rejected_text(exc: SwingRejected) -> str:
+    return _SWING_RULE_TEXT.get(exc.code or "", _SWING_REJECTED_TEXT)
 
 
 async def _mining_swing(
@@ -2208,38 +2293,75 @@ async def _mining_swing(
     rest_below: Optional[float] = None,
 ) -> SwingOutcome:
     """
-    1. n = next_mining_attempt(guild, user) — atomic increment in Supabase.
-    2. roll = mining_roll(seed, guild, user, node, n) — inside execute_swing,
-       i.e. only AFTER the counter succeeded.
-    3. Apply stamina + inventory to the player.
+    THE swing (manual and auto), serialised per player:
+      0. [auto only] rest_player first if stamina < rest_below (while policy allows /rest)
+      1. begin_swing: rate limit → n = counter + 1 (atomic) → stamina now (DB clock)
+      2. roll = mining_roll(seed, guild, user, node, n) inside execute_swing — only after 1
+      3. record_swing: result + stamina + item in ONE transaction, once per n
 
-    Any DB failure raises SwingRejected and nothing changes: there is no
-    fallback roll and no in-memory counter.
+    Any DB failure raises SwingRejected: no fallback roll, no in-memory counter,
+    the node's reserve is put back, and the cache is untouched.
     """
     record = _GLOBAL_WORLD_RECORDS.get(guild_id)
     if record is None or record.status != STATUS_ACTIVE:
         raise WorldPending(guild_id)
     seed = _world_seed(record)
-    try:
-        attempt = await _run_db(_economy_db.next_mining_attempt, guild_id, user_id)
-    except Exception as exc:
-        log.warning("Swing rejected guild=%d user=%d: attempt counter unavailable (%s)", guild_id, user_id, exc)
-        raise SwingRejected(str(exc)) from exc
 
-    # Stamina is read only now: a concurrent swing of the same user may have spent it.
-    if rest_below is not None and player.stamina < rest_below:
-        player.stamina = _DEFAULT_STAMINA          # auto-rest, same as the free /rest
-    outcome = execute_swing(
-        _miner, _crystal_factory,
-        seed=seed, guild_id=guild_id, user_id=user_id, attempt=attempt, node_id=node_id,
-        pickaxe=pickaxe, stamina=player.stamina, state=state, catalog=catalog,
-    )
-    player.stamina = max(0.0, player.stamina - outcome.result.stamina_consumed)
-    if isinstance(outcome.item, OreItem):
-        player.ore_bag.append(outcome.item)
-    elif isinstance(outcome.item, CrystalItem):
-        player.crystal_bag.append(outcome.item)
-    return outcome
+    async with _player_lock(guild_id, user_id):
+        try:
+            if rest_below is not None and player.stamina < rest_below:
+                try:
+                    _, player.stamina = await _run_db(_economy_db.rest_player, guild_id, user_id)
+                except LedgerRejected as exc:
+                    if exc.code != "rest_disabled":
+                        raise
+            attempt, stamina = await _run_db(_economy_db.begin_swing, guild_id, user_id)
+        except LedgerRejected as exc:
+            raise SwingRejected(str(exc), exc.code) from exc
+        except Exception as exc:
+            log.warning("Swing rejected guild=%d user=%d: attempt counter unavailable (%s)", guild_id, user_id, exc)
+            raise SwingRejected(str(exc)) from exc
+        player.stamina = stamina
+
+        node = state.active_ores.get(node_id) or state.active_crystals.get(node_id)
+        before = (node.current_reserve, node.is_depleted) if node is not None else None
+
+        def restore_node() -> None:
+            if node is not None:
+                node.current_reserve, node.is_depleted = before
+
+        try:
+            outcome = execute_swing(
+                _miner, _crystal_factory,
+                seed=seed, guild_id=guild_id, user_id=user_id, attempt=attempt, node_id=node_id,
+                pickaxe=pickaxe, stamina=stamina, state=state, catalog=catalog,
+            )
+        except BaseException:
+            restore_node()
+            raise
+        item = outcome.item
+        try:
+            stamina_after, item_id, _ = await _run_db(
+                _economy_db.record_swing, guild_id, user_id, attempt,
+                node_id=node_id, success=outcome.result.success, critical_hit=outcome.result.critical_hit,
+                amount_extracted=outcome.result.amount_extracted,
+                stamina_consumed=outcome.result.stamina_consumed,
+                item_kind=None if item is None else ("ore" if isinstance(item, OreItem) else "crystal"),
+                item_uuid=None if item is None else item.item_uuid,
+                item_payload=None if item is None else item.to_dict(),
+            )
+        except LedgerRejected as exc:
+            restore_node()
+            raise SwingRejected(str(exc), exc.code) from exc
+        except Exception as exc:
+            restore_node()
+            log.warning("Swing #%d guild=%d user=%d not recorded (%s) — discarded", attempt, guild_id, user_id, exc)
+            raise SwingRejected(str(exc)) from exc
+
+        player.stamina = stamina_after
+        if item_id is not None and item is not None:
+            player.held[item_id] = item
+        return outcome
 
 
 # ── External witness ─────────────────────────────────────────────────────────
