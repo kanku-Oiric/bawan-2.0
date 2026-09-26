@@ -10,6 +10,26 @@ Bot Discord ekonomi MMORPG per-server. Dunia tiap server (unsur, ore, crystal, m
 4. `python main_core.py`
 5. Cek semuanya sekaligus: `python cek_live.py` (keamanan, registry, ledger, commitment, tes worldgen).
 
+## Backup & restore
+
+`scripts/backup_db.py` menyimpan satu CSV per tabel + `manifest.json` (jumlah baris, SHA-256 tiap file, snapshot `ledger_audit()`). Read-only terhadap database. **Folder backup wajib di luar repo** — isinya Discord ID dan saldo; script menolak folder di dalam repo.
+
+```
+python scripts/backup_db.py                          # project utama → ../bawan-backups/<ref>/<waktu>/
+python scripts/backup_db.py --out D:/backup/bawan    # atau set BAWAN_BACKUP_DIR
+python scripts/backup_db.py --keep 30                # hapus backup lama, sisakan 30 terbaru
+python scripts/backup_db.py --test                   # project TES
+```
+
+Rutin harian:
+
+- Windows (Task Scheduler): `schtasks /create /tn "Bawan backup" /sc daily /st 03:00 /tr "\"D:\bawan file 2.0\venv\Scripts\python.exe\" \"D:\bawan file 2.0\scripts\backup_db.py\" --keep 30"`
+- VPS (cron): `0 3 * * * cd /opt/bawan && venv/bin/python scripts/backup_db.py --out /var/backups/bawan --keep 30`
+
+Exit code 1 kalau `ledger_audit()` tidak bersih saat backup — jadikan itu alarm.
+
+Restore (ke project kosong): jalankan `supabase/schema.sql`, lalu dari `psql` (connection string di Supabase → Settings → Database) `\copy public.<tabel> (<kolom sesuai header CSV>) from '<tabel>.csv' with (format csv, header true)` dengan urutan: `server_registry`, `world_nonces`, `world_commitments`, `world_witness_log`, `currencies`, `voice_config`, `mining_attempts`, `players`, `items`, `ledger`, `item_disposals`, `mining_results`, `voice_ticks`. Sebelum `players`, jalankan `select set_config('bawan.ledger', 'on', false);` di sesi yang sama (trigger wallet menolak saldo ≠ 0 tanpa itu). Sesudahnya: `select setval('public.ledger_id_seq', (select max(id) from public.ledger));`, samakan `production_policy` dengan CSV lewat UPDATE, lalu pastikan `select public.ledger_audit();` bersih.
+
 ## Saldo & ledger (schema v7)
 
 Database adalah satu-satunya sumber kebenaran. Setiap perubahan pemain = **satu fungsi = satu transaksi Postgres**, dan setiap perubahan saldo meninggalkan satu baris di `ledger` (insert-only). Bot tidak punya flush berkala; memori hanya salinan baca yang diisi dari hasil fungsi.
